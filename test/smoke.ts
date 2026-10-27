@@ -17,7 +17,7 @@ interface TestModules {
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
-  CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
+  refreshCursorToken: typeof import("../src/auth").refreshCursorToken;
   CursorV2Plugin: typeof CursorV2PluginModule;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
@@ -226,7 +226,6 @@ async function loadModules(): Promise<TestModules> {
   // These imports must run after the test sets the Cursor endpoint environment variables.
   const proxy = await import("../src/proxy");
   const auth = await import("../src/auth");
-  const index = await import("../src/index");
   const v2 = await import("../src/v2");
   const models = await import("../src/models");
   return {
@@ -235,7 +234,7 @@ async function loadModules(): Promise<TestModules> {
     getProxyPort: proxy.getProxyPort,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
-    CursorAuthPlugin: index.CursorAuthPlugin,
+    refreshCursorToken: auth.refreshCursorToken,
     CursorV2Plugin: v2.default,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
@@ -344,36 +343,6 @@ async function testTokenExpiry(modules: TestModules) {
   }
 
   console.log("[test] Token expiry OK");
-}
-
-async function testPluginShape(modules: TestModules) {
-  console.log("[test] Checking plugin export shape...");
-
-  const fakeInput = {
-    client: { auth: { set: async () => {} } },
-  } as any;
-  const hooks = await modules.CursorAuthPlugin(fakeInput);
-
-  if (!hooks.auth) {
-    throw new Error("Plugin hooks missing 'auth'");
-  }
-  if (hooks.auth.provider !== "cursor") {
-    throw new Error(`Expected provider 'cursor', got '${hooks.auth.provider}'`);
-  }
-  if (typeof hooks.auth.loader !== "function") {
-    throw new Error("Plugin hooks.auth.loader is not a function");
-  }
-  if (!Array.isArray(hooks.auth.methods) || hooks.auth.methods.length === 0) {
-    throw new Error("Plugin hooks.auth.methods missing or empty");
-  }
-  if (hooks.auth.methods[0].type !== "oauth") {
-    throw new Error(`Expected method type 'oauth', got '${hooks.auth.methods[0].type}'`);
-  }
-  if (typeof hooks.auth.methods[0].authorize !== "function") {
-    throw new Error("Plugin auth method missing authorize function");
-  }
-
-  console.log("[test] Plugin shape OK");
 }
 
 async function testV2Plugin(
@@ -748,30 +717,9 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     { id: "fresh-model", name: "Fresh Model", reasoning: true },
   ]);
 
-  let authState = {
-    type: "oauth" as const,
-    access: "expired-access",
-    refresh: "valid-refresh",
-    expires: Date.now() - 10_000,
-  };
-  const writes: Array<{ access: string; refresh: string; expires: number }> = [];
-  const hooks = await modules.CursorAuthPlugin({
-    client: {
-      auth: {
-        set: async ({ body }: any) => {
-          writes.push(body);
-          authState = body;
-        },
-      },
-    },
-  } as any);
-  const provider = { models: {} as Record<string, unknown> } as any;
-
-  await hooks.auth!.loader(async () => authState, provider);
-
-  assertEqual(writes.length, 1, "Expected refreshed auth to be persisted once");
+  const refreshed = await modules.refreshCursorToken("valid-refresh");
   assert(
-    writes[0]?.access && writes[0].access !== "expired-access",
+    refreshed.access !== "expired-access",
     "Expected refreshed access token to replace the expired token",
   );
   assertArrayEqual(
@@ -779,17 +727,18 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     ["Bearer valid-refresh"],
     "Expected refresh endpoint to be called with the stored refresh token",
   );
+
+  const models = await modules.getCursorModels(refreshed.access);
   assert(
-    backend.getDiscoveryAuthHeaders().every((header) => header === `Bearer ${writes[0]?.access}`),
+    backend.getDiscoveryAuthHeaders().every((header) => header === `Bearer ${refreshed.access}`),
     `Expected discovery to use the refreshed token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
   );
   assertArrayEqual(
-    Object.keys(provider.models),
+    models.map((model) => model.id),
     ["auto", "fresh-model"],
-    "Expected provider models to come from successful discovery",
+    "Expected models to come from successful discovery",
   );
 
-  modules.stopProxy();
   console.log("[test] Refresh-before-discovery OK");
 }
 
@@ -799,40 +748,27 @@ async function testDiscoveryFallbackAndSuccess(
 ) {
   console.log("[test] Testing discovery fallback and success...");
 
-  const authState = {
-    type: "oauth" as const,
-    access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
-    refresh: "valid-refresh",
-    expires: Date.now() + 3_600_000,
-  };
-  const hooks = await modules.CursorAuthPlugin({
-    client: {
-      auth: {
-        set: async () => {},
-      },
-    },
-  } as any);
-  const provider = { models: { stale: { id: "stale" } } } as any;
+  const accessToken = makeJwt(Math.floor(Date.now() / 1000) + 3600);
 
   // Failed discovery should fall back to hardcoded models
   modules.clearModelCache();
   backend.setDiscoveryMode("empty");
-  const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
+  const fallbackModels = await modules.getCursorModels(accessToken);
   assert(
-    Object.keys(provider.models).length > 0,
-    "Expected fallback models to be registered when discovery fails",
+    fallbackModels.length > 1 && fallbackModels.some((model) => model.id === "auto"),
+    "Expected fallback models (plus auto) when discovery fails",
   );
-  assert(
-    !("stale" in provider.models),
-    "Expected stale models to be replaced",
-  );
-  const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
-  assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
-  const degradedModelsBody = await degradedModelsRes.json();
-  assert(
-    degradedModelsBody.data.length > 0,
+
+  const fallbackPort = await modules.startProxy(async () => accessToken, fallbackModels);
+  const fallbackRes = await fetch(`http://localhost:${fallbackPort}/v1/models`);
+  assertEqual(fallbackRes.status, 200, "Expected degraded /v1/models to succeed");
+  const fallbackBody = await fallbackRes.json();
+  assertEqual(
+    fallbackBody.data.length,
+    fallbackModels.length,
     "Expected proxy /v1/models to expose fallback models",
   );
+  modules.stopProxy();
 
   // Successful discovery should replace with real models
   modules.clearModelCache();
@@ -841,17 +777,19 @@ async function testDiscoveryFallbackAndSuccess(
     { id: "real-model-a", name: "Real Model A" },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
-  const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
+  const discovered = await modules.getCursorModels(accessToken);
   assertArrayEqual(
-    Object.keys(provider.models).sort(),
+    discovered.map((model) => model.id).sort(),
     ["auto", "real-model-a", "real-model-b"],
     "Expected successful discovery to replace fallback models",
   );
-  const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
-  assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models to succeed");
-  const discoveredModelsBody = await discoveredModelsRes.json();
+
+  const discoveredPort = await modules.startProxy(async () => accessToken, discovered);
+  const discoveredRes = await fetch(`http://localhost:${discoveredPort}/v1/models`);
+  assertEqual(discoveredRes.status, 200, "Expected discovered /v1/models to succeed");
+  const discoveredBody = await discoveredRes.json();
   assertArrayEqual(
-    discoveredModelsBody.data.map((model: { id: string }) => model.id).sort(),
+    discoveredBody.data.map((model: { id: string }) => model.id).sort(),
     ["auto", "real-model-a", "real-model-b"],
     "Expected proxy /v1/models to expose discovered models",
   );
@@ -871,7 +809,6 @@ async function main() {
     await testProxyStartStop(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
-    await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);

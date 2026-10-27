@@ -30,26 +30,6 @@ You can also add the package directly to `opencode.jsonc`:
 }
 ```
 
-## OpenCode V1
-
-Add the package to `~/.config/opencode/opencode.json`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "opencode-cursor-oauth"
-  ]
-}
-```
-
-Connect Cursor:
-
-```sh
-opencode auth login --provider cursor
-```
-
-OpenCode V1 and OpenCode V2 add the `cursor` provider and its models.
 OpenCode installs npm plugins during startup.
 You do not have to clone this repository.
 
