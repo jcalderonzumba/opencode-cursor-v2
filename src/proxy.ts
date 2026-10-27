@@ -2198,9 +2198,22 @@ async function handleNonStreamingResponse(
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await (proxyDisableHttp2
-    ? collectFullResponseHttp1(payload, accessToken, convKey)
-    : collectFullResponse(payload, accessToken, convKey));
+  let collected: CollectedResponse;
+  if (proxyDisableHttp2) {
+    try {
+      collected = await collectFullResponseHttp1(payload, accessToken, convKey);
+    } catch (err) {
+      // Same shape as the proxy's other server errors.
+      const message = err instanceof Error ? err.message : String(err);
+      return new Response(
+        JSON.stringify({ error: { message, type: "server_error", code: "internal_error" } }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  } else {
+    collected = await collectFullResponse(payload, accessToken, convKey);
+  }
+  const { text, usage } = collected;
   return new Response(JSON.stringify({ id: completionId, object: "chat.completion", created, model: modelId, choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }], usage }), { headers: { "Content-Type": "application/json" } });
 }
 
@@ -2209,11 +2222,13 @@ async function collectFullResponseHttp1(
   accessToken: string,
   convKey: string,
 ): Promise<{ text: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }> {
-  const { promise, resolve } = Promise.withResolvers<{ text: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }>();
+  const { promise, resolve, reject } = Promise.withResolvers<{ text: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }>();
   let fullText = "";
   const requestId = crypto.randomUUID();
+  let channelError: Error | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const http1 = createHttp1ClientChannel(accessToken, requestId, (err) => {
+    channelError ??= err;
     void reader?.cancel(err).catch(() => {});
   });
   const sendFrame = http1.sendFrame;
@@ -2248,11 +2263,20 @@ async function collectFullResponseHttp1(
     () => {},
   );
   const pump = async (): Promise<void> => {
-    try { while (true) { const { done, value } = await bodyReader.read(); if (done) break; parser.push(value); } parser.flush(); }
-    catch {}
+    let failure: unknown;
+    try {
+      while (true) { const { done, value } = await bodyReader.read(); if (done) break; parser.push(value); }
+      if (channelError) throw channelError;
+      parser.flush();
+    }
+    catch (e) { failure = e; }
     finally { teardown(); }
     const stored = conversationStates.get(convKey);
     if (stored) { for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v); stored.lastAccessMs = Date.now(); persistConversation(convKey, stored); }
+    if (failure) {
+      reject(failure instanceof Error ? failure : new Error(String(failure)));
+      return;
+    }
     const flushed = tagFilter.flush(); fullText += flushed.content;
     resolve({ text: fullText, usage: computeUsage(state) });
   };

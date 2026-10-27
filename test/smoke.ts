@@ -54,6 +54,8 @@ interface TestCursorBackend {
   getOpenRunStreamCount: () => number;
   /** Refuse connections of the other protocol, like a network that blocks HTTP/2. */
   setAllowedTransport: (transport: "both" | "h1" | "h2") => void;
+  /** HTTP/1.1 only: reset the RunSSE socket after a partial reply, or fail every BidiAppend. */
+  setHttp1Fault: (fault: "read-error" | "bidi-error" | undefined) => void;
   /** One `h1 <path>` / `h2 <path>` entry per request that reached the backend. */
   getRequests: () => string[];
   resetObservations: () => void;
@@ -175,6 +177,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const refreshAuthHeaders: string[] = [];
   const requests: string[] = [];
   let allowedTransport: "both" | "h1" | "h2" = "both";
+  let http1Fault: "read-error" | "bidi-error" | undefined;
 
   const discoveryProto = () =>
     toBinary(
@@ -241,7 +244,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       }
       if (path === "/agent.v1.AgentService/RunSSE") {
         res.writeHead(200, { "Content-Type": "text/event-stream" });
-        if (holdRunStream) {
+        if (http1Fault === "read-error") {
+          res.write(frameRunTextDelta("partial"));
+          setTimeout(() => res.destroy(), 50);
+          return;
+        }
+        if (holdRunStream || http1Fault === "bidi-error") {
           const closed = runStreamClosed;
           heldHttp1Responses.add(res);
           res.on("close", () => {
@@ -255,6 +263,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         return;
       }
       if (path === "/aiserver.v1.BidiService/BidiAppend") {
+        if (http1Fault === "bidi-error") {
+          res.writeHead(500);
+          res.end();
+          return;
+        }
         res.writeHead(200, { "Content-Type": "application/proto" });
         res.end();
         return;
@@ -393,6 +406,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     setAllowedTransport(transport) {
       allowedTransport = transport;
+    },
+    setHttp1Fault(fault) {
+      http1Fault = fault;
     },
     getRequests() {
       return [...requests];
@@ -629,6 +645,43 @@ process.exit(0);
     rmSync(root, { recursive: true, force: true });
   }
   console.log("[test] Bridge path under odd install dir OK");
+}
+
+async function testHttp1NonStreamingSurfacesUpstreamErrors(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing non-streaming HTTP/1.1 upstream failures...");
+  for (const fault of ["read-error", "bidi-error"] as const) {
+    backend.resetObservations();
+    backend.setHttp1Fault(fault);
+    try {
+      const port = await modules.startProxy(async () => "test-token", [], true);
+      const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [{ role: "user", content: `non-streaming ${fault}` }],
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const text = await res.text();
+      assertEqual(res.status, 500, `${fault}: expected an error response, got ${text}`);
+      const body = JSON.parse(text);
+      assertEqual(body.error?.type, "server_error", `${fault}: expected the proxy error shape`);
+      assert(!text.includes("partial"), `${fault}: expected no partial text, got ${text}`);
+      await waitFor(
+        () => backend.getOpenRunStreamCount() === 0,
+        `${fault}: the HTTP/1.1 RunSSE stream to close after the failure`,
+      );
+    } finally {
+      backend.setHttp1Fault(undefined);
+      modules.stopProxy();
+    }
+  }
+  console.log("[test] Non-streaming HTTP/1.1 failures OK");
 }
 
 async function waitFor(condition: () => boolean, message: string) {
@@ -1588,6 +1641,7 @@ async function main() {
     await testStreamCancellationStopsBridge(modules, backend);
     await testBridgeResolvesUnderOddInstallPath(backend);
     await testHttp1StreamCancellationAndStop(modules, backend);
+    await testHttp1NonStreamingSurfacesUpstreamErrors(modules, backend);
     await testCancelPausedBridgeKeepsBridge(modules, backend);
     await testStopProxyClearsPausedBridges(modules, backend);
     await testAuthParams(modules);
