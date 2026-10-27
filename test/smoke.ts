@@ -1,3 +1,6 @@
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import http from "node:http";
 import http2 from "node:http2";
 import net, { type AddressInfo } from "node:net";
@@ -584,6 +587,48 @@ async function testHttp1StreamCancellationAndStop(
     }
   }
   console.log("[test] HTTP/1.1 stream teardown OK");
+}
+
+/** A plugin installed under a path with a space and a non-ASCII character must still find its bridge. */
+async function testBridgeResolvesUnderOddInstallPath(backend: TestCursorBackend) {
+  console.log("[test] Testing HTTP/2 bridge under a path with spaces and non-ASCII...");
+  const root = mkdtempSync(join(tmpdir(), "cursor-bridge-"));
+  try {
+    const installDir = join(root, "Application Support ñ", "plugin");
+    mkdirSync(installDir, { recursive: true });
+    cpSync(resolve(import.meta.dir, "../src"), join(installDir, "src"), { recursive: true });
+    symlinkSync(resolve(import.meta.dir, "../node_modules"), join(root, "node_modules"));
+    writeFileSync(
+      join(installDir, "run.ts"),
+      `import { getCursorModels } from "./src/models";
+console.log(JSON.stringify((await getCursorModels("test-token", false)).map((m) => m.id)));
+process.exit(0);
+`,
+    );
+    backend.resetObservations();
+    backend.setDiscoveryMode("success");
+    backend.setDiscoveredModels([{ id: "odd-path-model", name: "Odd Path Model" }]);
+    backend.setAllowedTransport("h2");
+    const child = Bun.spawn([process.execPath, join(installDir, "run.ts")], {
+      env: { ...process.env, CURSOR_API_URL: process.env.CURSOR_API_URL! },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    assertArrayEqual(
+      JSON.parse(out.trim().split("\n").pop() ?? "[]").sort(),
+      ["auto", "odd-path-model"],
+      `Expected HTTP/2 discovery from the odd install path, not the fallback list (stderr: ${err})`,
+    );
+  } finally {
+    backend.setAllowedTransport("both");
+    rmSync(root, { recursive: true, force: true });
+  }
+  console.log("[test] Bridge path under odd install dir OK");
 }
 
 async function waitFor(condition: () => boolean, message: string) {
@@ -1541,6 +1586,7 @@ async function main() {
     await testProxyStartStop(modules);
     await testStreamingFrameParser();
     await testStreamCancellationStopsBridge(modules, backend);
+    await testBridgeResolvesUnderOddInstallPath(backend);
     await testHttp1StreamCancellationAndStop(modules, backend);
     await testCancelPausedBridgeKeepsBridge(modules, backend);
     await testStopProxyClearsPausedBridges(modules, backend);

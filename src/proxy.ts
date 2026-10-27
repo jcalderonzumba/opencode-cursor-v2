@@ -87,7 +87,7 @@ import { isAbsolute, resolve as pathResolve } from "node:path";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
-const BRIDGE_PATH = new URL("./h2-bridge.mjs", import.meta.url).pathname;
+const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
