@@ -29,6 +29,7 @@ interface TestModules {
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   refreshCursorToken: typeof import("../src/auth").refreshCursorToken;
   CursorV2Plugin: typeof CursorV2PluginModule;
+  setHttp1PausedStreamMaxMsForTesting: typeof import("../src/proxy").setHttp1PausedStreamMaxMsForTesting;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
 }
@@ -257,6 +258,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
             closed.resolve();
           });
           res.write(frameRunTextDelta("streaming"));
+          if (runStreamToolCallId) res.write(frameRunToolCall(runStreamToolCallId));
           return;
         }
         res.end(frameRunTextDelta("from-http1"));
@@ -460,6 +462,7 @@ async function loadModules(): Promise<TestModules> {
     getTokenExpiry: auth.getTokenExpiry,
     refreshCursorToken: auth.refreshCursorToken,
     CursorV2Plugin: v2.default,
+    setHttp1PausedStreamMaxMsForTesting: proxy.setHttp1PausedStreamMaxMsForTesting,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
@@ -682,6 +685,64 @@ async function testHttp1NonStreamingSurfacesUpstreamErrors(
     }
   }
   console.log("[test] Non-streaming HTTP/1.1 failures OK");
+}
+
+async function testHttp1PausedStreamIsCapped(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing HTTP/1.1 paused stream lifetime cap...");
+  const capMs = 1_000;
+  modules.setHttp1PausedStreamMaxMsForTesting(capMs);
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamToolCall("call-h1-paused");
+  const first = new AbortController();
+  const second = new AbortController();
+  try {
+    const port = await modules.startProxy(async () => "test-token", [], true);
+    const pausedAt = Date.now();
+    const firstRes = await postChat(port, toolCallMessages("call-h1-paused", false), first.signal);
+    const firstBody = await readUntilDone(firstRes);
+    assert(firstBody.includes("call-h1-paused"), `Expected a tool call, got ${firstBody}`);
+    assertEqual(backend.getOpenRunStreamCount(), 1, "Expected the paused RunSSE stream to stay open");
+
+    // The continuation is a new RunSSE; it must outlive the paused stream's cap.
+    backend.setRunStreamToolCall(undefined);
+    const secondRes = await postChat(port, toolCallMessages("call-h1-paused", true), second.signal);
+    assertEqual(secondRes.status, 200, "Expected the continuation to be served");
+    const reader = secondRes.body!.getReader();
+    await reader.read();
+    await waitFor(
+      () => backend.getOpenRunStreamCount() === 2,
+      "the continuation RunSSE stream to open",
+    );
+    assert(Date.now() - pausedAt < capMs, "Test too slow: the continuation must start before the cap");
+
+    await waitFor(
+      () => backend.getOpenRunStreamCount() === 1,
+      "the paused HTTP/1.1 stream to be torn down after the cap",
+    );
+    await Bun.sleep(capMs + 200);
+    assertEqual(
+      backend.getOpenRunStreamCount(),
+      1,
+      "Expected the live continuation stream to survive the cap",
+    );
+    second.abort();
+    await waitFor(
+      () => backend.getOpenRunStreamCount() === 0,
+      "the continuation stream to close on cancel",
+    );
+  } finally {
+    first.abort();
+    second.abort();
+    modules.stopProxy();
+    backend.setHoldRunStream(false);
+    backend.setRunStreamToolCall(undefined);
+    modules.setHttp1PausedStreamMaxMsForTesting();
+  }
+  console.log("[test] HTTP/1.1 paused stream cap OK");
 }
 
 async function waitFor(condition: () => boolean, message: string) {
@@ -1642,6 +1703,7 @@ async function main() {
     await testBridgeResolvesUnderOddInstallPath(backend);
     await testHttp1StreamCancellationAndStop(modules, backend);
     await testHttp1NonStreamingSurfacesUpstreamErrors(modules, backend);
+    await testHttp1PausedStreamIsCapped(modules, backend);
     await testCancelPausedBridgeKeepsBridge(modules, backend);
     await testStopProxyClearsPausedBridges(modules, backend);
     await testAuthParams(modules);

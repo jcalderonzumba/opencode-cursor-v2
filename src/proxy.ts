@@ -333,6 +333,16 @@ const activeBridges = new Map<string, ActiveBridge>();
 // Teardown hooks for live HTTP/1.1 streams, called by stopProxy().
 const activeHttp1Streams = new Set<() => void>();
 
+// After a tool call the HTTP/1.1 stream stays open, and the continuation is a
+// new request. Cursor may never close the old one, so cap how long it lives.
+const HTTP1_PAUSED_STREAM_MAX_MS = 10 * 60 * 1000;
+let http1PausedStreamMaxMs = HTTP1_PAUSED_STREAM_MAX_MS;
+
+/** Test hook: shorten the paused-stream cap. Call without an argument to restore it. */
+export function setHttp1PausedStreamMaxMsForTesting(ms = HTTP1_PAUSED_STREAM_MAX_MS): void {
+  http1PausedStreamMaxMs = ms;
+}
+
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const CONVERSATION_DISK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1756,7 +1766,9 @@ async function handleHttp1StreamingResponse(
       const sendFrame = http1.sendFrame;
       const abort = new AbortController();
       // Stops BidiAppend retries and the heartbeat, and aborts the RunSSE body.
+      let pausedTimer: ReturnType<typeof setTimeout> | undefined;
       const teardown = () => {
+        clearTimeout(pausedTimer);
         http1.stop();
         abort.abort();
         activeHttp1Streams.delete(teardown);
@@ -1785,6 +1797,9 @@ async function handleHttp1StreamingResponse(
               const toolCallIndex = state.toolCallIndex++;
               sendSSE(makeChunk({ tool_calls: [{ index: toolCallIndex, id: exec.toolCallId, type: "function", function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
               sendSSE(makeChunk({}, "tool_calls")); sendDone(); closeController();
+              // The SSE is closed but the upstream stays open; bound it.
+              pausedTimer ??= setTimeout(teardown, http1PausedStreamMaxMs);
+              pausedTimer.unref?.();
             },
             (checkpointBytes) => {
               const stored = conversationStates.get(convKey);
