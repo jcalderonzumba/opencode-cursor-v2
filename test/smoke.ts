@@ -1,10 +1,12 @@
 import http from "node:http";
 import http2 from "node:http2";
-import type { AddressInfo } from "node:net";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import net, { type AddressInfo } from "node:net";
+import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
+  BidiRequestIdSchema,
+  ClientHeartbeatSchema,
   ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
   InteractionUpdateSchema,
@@ -47,6 +49,10 @@ interface TestCursorBackend {
   /** While holding, also emit an MCP tool call with this id; the stream answers the tool result and ends. */
   setRunStreamToolCall: (toolCallId: string | undefined) => void;
   getOpenRunStreamCount: () => number;
+  /** Refuse connections of the other protocol, like a network that blocks HTTP/2. */
+  setAllowedTransport: (transport: "both" | "h1" | "h2") => void;
+  /** One `h1 <path>` / `h2 <path>` entry per request that reached the backend. */
+  getRequests: () => string[];
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
@@ -160,9 +166,28 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const discoveryRequestBodies: Uint8Array[] = [];
   let runStreamClosed = Promise.withResolvers<void>();
   const heldRunStreams = new Set<http2.ServerHttp2Stream>();
+  const heldHttp1Responses = new Set<http.ServerResponse>();
   let holdRunStream = false;
   let runStreamToolCallId: string | undefined;
   const refreshAuthHeaders: string[] = [];
+  const requests: string[] = [];
+  let allowedTransport: "both" | "h1" | "h2" = "both";
+
+  const discoveryProto = () =>
+    toBinary(
+      GetUsableModelsResponseSchema,
+      create(GetUsableModelsResponseSchema, {
+        models: discoveredModels.map((model) =>
+          create(ModelDetailsSchema, {
+            modelId: model.id,
+            displayModelId: model.id,
+            displayName: model.name,
+            displayNameShort: model.name,
+            aliases: [],
+          }),
+        ),
+      }),
+    );
 
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
@@ -191,9 +216,55 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   await new Promise<void>((resolve) => refreshServer.listen(0, "127.0.0.1", resolve));
   const refreshPort = (refreshServer.address() as AddressInfo).port;
 
-  const apiServer = http2.createServer();
-  apiServer.on("stream", (stream, headers) => {
+  // HTTP/1.1 twin of the h2 handler below: the transport the fallback uses.
+  const http1Server = http.createServer((req, res) => {
+    const path = req.url ?? "";
+    requests.push(`h1 ${path}`);
+    const authHeader = req.headers.authorization ?? "";
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      if (path === "/agent.v1.AgentService/GetUsableModels") {
+        discoveryAuthHeaders.push(authHeader);
+        discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
+        if (discoveryMode === "auth-error" || authHeader === "Bearer expired-access") {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ code: "unauthenticated", message: "expired token" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/proto" });
+        res.end(discoveryMode === "empty" ? Buffer.alloc(0) : Buffer.from(discoveryProto()));
+        return;
+      }
+      if (path === "/agent.v1.AgentService/RunSSE") {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        if (holdRunStream) {
+          const closed = runStreamClosed;
+          heldHttp1Responses.add(res);
+          res.on("close", () => {
+            heldHttp1Responses.delete(res);
+            closed.resolve();
+          });
+          res.write(frameRunTextDelta("streaming"));
+          return;
+        }
+        res.end(frameRunTextDelta("from-http1"));
+        return;
+      }
+      if (path === "/aiserver.v1.BidiService/BidiAppend") {
+        res.writeHead(200, { "Content-Type": "application/proto" });
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+
+  const http2Server = http2.createServer();
+  http2Server.on("stream", (stream, headers) => {
     const path = String(headers[":path"] ?? "");
+    requests.push(`h2 ${path}`);
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
       const closed = runStreamClosed;
@@ -262,22 +333,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 
         const responseBody = discoveryMode === "empty"
           ? frameConnectUnaryMessage(new Uint8Array())
-          : frameConnectUnaryMessage(
-              toBinary(
-                GetUsableModelsResponseSchema,
-                create(GetUsableModelsResponseSchema, {
-                  models: discoveredModels.map((model) =>
-                    create(ModelDetailsSchema, {
-                      modelId: model.id,
-                      displayModelId: model.id,
-                      displayName: model.name,
-                      displayNameShort: model.name,
-                      aliases: [],
-                    }),
-                  ),
-                }),
-              ),
-            );
+          : frameConnectUnaryMessage(discoveryProto());
         stream.respond({
           ":status": 200,
           "content-type": "application/connect+proto",
@@ -288,6 +344,23 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 
       stream.respond({ ":status": 404 });
       stream.end();
+    });
+  });
+  // One port serves both protocols: cleartext HTTP/2 starts with the "PRI " preface.
+  const sockets = new Set<net.Socket>();
+  const apiServer = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.once("data", (first) => {
+      socket.pause();
+      socket.unshift(first);
+      const isH2 = first.toString("latin1", 0, 4) === "PRI ";
+      if (allowedTransport !== "both" && allowedTransport !== (isH2 ? "h2" : "h1")) {
+        socket.destroy();
+        return;
+      }
+      (isH2 ? http2Server : http1Server).emit("connection", socket);
+      socket.resume();
     });
   });
   await new Promise<void>((resolve) => apiServer.listen(0, "127.0.0.1", resolve));
@@ -306,15 +379,23 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       holdRunStream = hold;
       if (!hold) {
         for (const stream of heldRunStreams) stream.close();
+        for (const res of heldHttp1Responses) res.end();
       }
     },
     setRunStreamToolCall(toolCallId) {
       runStreamToolCallId = toolCallId;
     },
     getOpenRunStreamCount() {
-      return heldRunStreams.size;
+      return heldRunStreams.size + heldHttp1Responses.size;
+    },
+    setAllowedTransport(transport) {
+      allowedTransport = transport;
+    },
+    getRequests() {
+      return [...requests];
     },
     resetObservations() {
+      requests.length = 0;
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
@@ -333,6 +414,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       return [...refreshAuthHeaders];
     },
     async close() {
+      for (const socket of sockets) socket.destroy();
       await Promise.all([
         new Promise<void>((resolve, reject) =>
           apiServer.close((error) => (error ? reject(error) : resolve())),
@@ -457,6 +539,51 @@ async function testStreamCancellationStopsBridge(
     backend.setHoldRunStream(false);
   }
   console.log("[test] SSE cancellation teardown OK");
+}
+
+async function testHttp1StreamCancellationAndStop(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing HTTP/1.1 stream teardown on cancel and stopProxy...");
+  for (const how of ["cancel", "stopProxy"] as const) {
+    backend.resetObservations();
+    backend.setHoldRunStream(true);
+    const controller = new AbortController();
+    try {
+      const port = await modules.startProxy(async () => "test-token", [], true);
+      const res = await postChat(
+        port,
+        [{ role: "user", content: `hello ${how}` }],
+        controller.signal,
+      );
+      assertEqual(res.status, 200, "Expected a streaming response");
+      await waitFor(
+        () => backend.getOpenRunStreamCount() === 1,
+        "the HTTP/1.1 RunSSE stream to open",
+      );
+      if (how === "cancel") controller.abort();
+      else modules.stopProxy();
+      await withTimeout(
+        backend.waitForRunStreamClose(),
+        `the HTTP/1.1 RunSSE stream to close after ${how}`,
+      );
+      // Teardown also ends the BidiAppend heartbeat.
+      await Bun.sleep(50);
+      const appends = backend.getRequests().filter((r) => r.endsWith("/BidiAppend")).length;
+      await Bun.sleep(300);
+      assertEqual(
+        backend.getRequests().filter((r) => r.endsWith("/BidiAppend")).length,
+        appends,
+        `Expected no BidiAppend after ${how}`,
+      );
+    } finally {
+      controller.abort();
+      modules.stopProxy();
+      backend.setHoldRunStream(false);
+    }
+  }
+  console.log("[test] HTTP/1.1 stream teardown OK");
 }
 
 async function waitFor(condition: () => boolean, message: string) {
@@ -771,6 +898,7 @@ async function testV2Plugin(
     },
   };
   const context = {
+    options: {},
     integration: {
       async transform(transform: IntegrationTransform) {
         integrationTransform = transform;
@@ -1087,6 +1215,314 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+
+async function testBridgeFraming() {
+  console.log("[test] Testing bridge frame format...");
+  
+  const payload = new Uint8Array([1, 2, 3, 4, 5]);
+  const frame = new Uint8Array(4 + payload.length);
+  frame.set(new Uint8Array([
+    (payload.length >> 24) & 0xff,
+    (payload.length >> 16) & 0xff,
+    (payload.length >> 8) & 0xff,
+    payload.length & 0xff,
+  ]));
+  frame.set(payload, 4);
+  
+  if (frame.length !== 9) {
+    throw new Error(`Expected frame length 9, got ${frame.length}`);
+  }
+  const len = (frame[0] << 24) | (frame[1] << 16) | (frame[2] << 8) | frame[3];
+  if (len !== 5) {
+    throw new Error(`Expected length 5, got ${len}`);
+  }
+  for (let i = 0; i < 5; i++) {
+    if (frame[4 + i] !== payload[i]) {
+      throw new Error(`Payload mismatch at index ${i}`);
+    }
+  }
+  
+  console.log("[test] Bridge framing OK");
+}
+
+async function testStreamingFrameParser() {
+  console.log("[test] Testing streaming frame parser...");
+  
+  const frame1 = Buffer.alloc(8);
+  frame1[0] = 0;
+  frame1.writeUInt32BE(3, 1);
+  frame1.set([1, 2, 3], 5);
+  
+  const frame2 = Buffer.alloc(7);
+  frame2[0] = 0;
+  frame2.writeUInt32BE(2, 1);
+  frame2.set([4, 5], 5);
+  
+  const combined = Buffer.concat([frame1, frame2]);
+  
+  const messages: Uint8Array[] = [];
+  let endStreamCalled = false;
+  
+  let pending = Buffer.alloc(0);
+  const parser = (incoming: Buffer) => {
+    pending = Buffer.concat([pending, incoming]);
+    while (pending.length >= 5) {
+      const flags = pending[0]!;
+      const msgLen = pending.readUInt32BE(1);
+      if (pending.length < 5 + msgLen) break;
+      const messageBytes = pending.subarray(5, 5 + msgLen);
+      pending = pending.subarray(5 + msgLen);
+      if (flags & 0b00000010) { endStreamCalled = true; }
+      else { messages.push(new Uint8Array(messageBytes)); }
+    }
+  };
+  
+  parser(combined);
+  
+  if (messages.length !== 2) {
+    throw new Error(`Expected 2 messages, got ${messages.length}`);
+  }
+  if (messages[0]!.length !== 3 || messages[1]!.length !== 2) {
+    throw new Error("Message lengths incorrect");
+  }
+  
+  console.log("[test] Streaming frame parser OK");
+}
+
+function assertBytesEqual(actual: Uint8Array, expected: Uint8Array, message: string): void {
+  if (Buffer.from(actual).equals(Buffer.from(expected))) return;
+  throw new Error(
+    `${message}: expected ${Buffer.from(expected).toString("hex")}, got ${Buffer.from(actual).toString("hex")}`,
+  );
+}
+
+async function testHttp1WireFormat() {
+  console.log("[test] Testing HTTP/1.1 wire format...");
+  const {
+    encodeConnectEnvelope,
+    buildHttp1CursorRequest,
+    encodeBidiAppendRequest,
+    decodeBidiAppendRequest,
+  } = await import("../src/proxy");
+
+  const jsonPayload = new TextEncoder().encode('{"payload":"foo"}');
+  assertEqual(jsonPayload.length, 17, "Expected documented StreamSSE payload length");
+  const envelope = encodeConnectEnvelope(jsonPayload);
+  assertEqual(envelope[0], 0, "Expected connect envelope flags 0");
+  assertEqual(envelope[1], 0, "Expected length byte 1");
+  assertEqual(envelope[2], 0, "Expected length byte 2");
+  assertEqual(envelope[3], 0, "Expected length byte 3");
+  assertEqual(envelope[4], 0x11, "Expected length 17");
+  assertBytesEqual(envelope.subarray(5), jsonPayload, "Expected envelope payload");
+
+  const raw = new Uint8Array([0xff, 0x01]);
+  const unary = buildHttp1CursorRequest(
+    "/agent.v1.AgentService/GetUsableModels",
+    raw,
+    true,
+    "rid-unary",
+  );
+  assertEqual(unary.path, "/agent.v1.AgentService/GetUsableModels", "Expected unary path");
+  assertEqual(unary.headers["Content-Type"], "application/proto", "Expected unary content type");
+  assert(unary.body === raw, "Expected unary body to be the original protobuf bytes");
+  assert(!("x-cursor-streaming" in unary.headers), "Expected unary request without streaming header");
+
+  const heartbeatMessage = create(AgentClientMessageSchema, {
+    message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
+  });
+  const heartbeat = toBinary(AgentClientMessageSchema, heartbeatMessage);
+  const unaryMessage = buildHttp1CursorRequest(
+    "/agent.v1.AgentService/GetUsableModels",
+    heartbeat,
+    true,
+    "rid-unary-msg",
+  );
+  assert(unaryMessage.body === heartbeat, "Expected unary AgentClientMessage bytes unchanged");
+  assert(
+    new TextDecoder().decode(unaryMessage.body) !== JSON.stringify(toJson(AgentClientMessageSchema, heartbeatMessage)),
+    "Expected unary body not to be JSON",
+  );
+  assertEqual(unaryMessage.body.length, heartbeat.length, "Expected no connect envelope on unary");
+
+  const stream = buildHttp1CursorRequest("/agent.v1.AgentService/Run", heartbeat, false, "rid-stream");
+  assertEqual(stream.path, "/agent.v1.AgentService/RunSSE", "Expected RunSSE path");
+  assertEqual(stream.headers["Content-Type"], "application/connect+proto", "Expected streaming content type");
+  assertEqual(stream.headers["x-cursor-streaming"], "true", "Expected streaming header");
+  assertEqual(stream.headers["x-request-id"], "rid-stream", "Expected request id header");
+  assertEqual(stream.body[0], 0, "Expected envelope flags");
+  const requestId = fromBinary(BidiRequestIdSchema, stream.body.subarray(5));
+  assertEqual(requestId.requestId, "rid-stream", "Expected RunSSE body to carry the request id");
+
+  const message = new Uint8Array([1, 2, 3, 255]);
+  const first = decodeBidiAppendRequest(encodeBidiAppendRequest(message, "req-123", 0));
+  assertEqual(first.dataHex, "010203ff", "Expected hex AgentClientMessage");
+  assertEqual(first.requestId, "req-123", "Expected BidiAppend request id");
+  assertEqual(first.appendSeqno, 0, "Expected append seqno 0");
+  const second = decodeBidiAppendRequest(encodeBidiAppendRequest(message, "req-123", 1));
+  assertEqual(second.appendSeqno, 1, "Expected append seqno 1");
+
+  console.log("[test] HTTP/1.1 wire format OK");
+}
+
+/** Minimal V2 context: a connected Cursor credential and a provider that records its models. */
+function createModeContext(options: Record<string, unknown>) {
+  let integrationTransform: IntegrationTransform | undefined;
+  let providerTransform: ProviderTransform | undefined;
+  const modelIDs: string[] = [];
+  const integrationDraft = {
+    update(_id: string, update: (integration: { name: string }) => void) {
+      update({ name: "cursor" });
+    },
+    method: { update() {} },
+  };
+  const providerDraft = {
+    add(input: { models: Array<{ id: string }> }) {
+      for (const model of input.models) modelIDs.push(model.id);
+    },
+  };
+  const credential = Credential.OAuth.make({
+    type: "oauth",
+    methodID: Integration.MethodID.make("cursor-oauth"),
+    refresh: "valid-refresh",
+    access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+    expires: Date.now() + 60 * 60 * 1000,
+  });
+  const context = {
+    options,
+    integration: {
+      async transform(transform: IntegrationTransform) {
+        integrationTransform = transform;
+        return { async dispose() {} };
+      },
+      async reload() {
+        integrationTransform?.(integrationDraft as unknown as IntegrationDraft);
+      },
+      connection: {
+        async active() {
+          return { type: "credential" as const, id: "cursor-test", label: "Cursor" };
+        },
+        async resolve() {
+          return credential;
+        },
+      },
+    },
+    provider: {
+      async transform(transform: ProviderTransform) {
+        providerTransform = transform;
+        return { async dispose() {} };
+      },
+      async reload() {
+        modelIDs.length = 0;
+        providerTransform?.(providerDraft as unknown as ProviderDraft);
+      },
+    },
+    event: {
+      subscribe() {
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => Promise.resolve({ done: true as const, value: undefined }),
+              return: () => Promise.resolve({ done: true as const, value: undefined }),
+            };
+          },
+        };
+      },
+    },
+  };
+  // SAFETY: The plugin only reads the options, integration, provider, and event domains.
+  return { context: context as unknown as V2Context, modelIDs };
+}
+
+/**
+ * Starts the V2 plugin with the given options, then checks which protocol both
+ * model discovery and a chat request used. The other protocol is refused, so a
+ * mismatch shows up as fallback models or a failed request.
+ */
+async function expectPluginTransport(
+  modules: TestModules,
+  backend: TestCursorBackend,
+  options: Record<string, unknown>,
+  expected: "h1" | "h2",
+  label: string,
+) {
+  modules.stopProxy();
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([{ id: "mode-model", name: "Mode Model" }]);
+  backend.setAllowedTransport(expected);
+  try {
+    const { context, modelIDs } = createModeContext(options);
+    const cleanup = await modules.CursorV2Plugin.setup(context);
+    try {
+      assertArrayEqual(
+        modelIDs.sort(),
+        ["auto", "mode-model"],
+        `${label}: expected discovery over ${expected}, not the fallback list`,
+      );
+      const discovery = backend.getRequests().filter((r) => r.endsWith("/GetUsableModels"));
+      assert(
+        discovery.length > 0 && discovery.every((r) => r.startsWith(expected)),
+        `${label}: expected discovery over ${expected}, got ${JSON.stringify(discovery)}`,
+      );
+
+      const port = modules.getProxyPort();
+      assert(port, `${label}: expected the plugin to start the proxy`);
+      const res = await postChat(port, [{ role: "user", content: "hello" }], AbortSignal.timeout(5_000));
+      const body = await readUntilDone(res);
+      const run = backend.getRequests().filter((r) => /\/(Run|RunSSE|BidiAppend)$/.test(r));
+      assert(
+        run.length > 0 && run.every((r) => r.startsWith(expected)),
+        `${label}: expected chat over ${expected}, got ${JSON.stringify(run)}`,
+      );
+      if (expected === "h1") {
+        assert(
+          run.some((r) => r.endsWith("/RunSSE")) && run.some((r) => r.endsWith("/BidiAppend")),
+          `${label}: expected RunSSE and BidiAppend, got ${JSON.stringify(run)}`,
+        );
+        assert(body.includes("from-http1"), `${label}: expected the RunSSE reply in the stream, got ${body}`);
+      }
+    } finally {
+      await cleanup();
+    }
+  } finally {
+    backend.setAllowedTransport("both");
+    modules.stopProxy();
+    modules.clearModelCache();
+  }
+}
+
+/** The env var is read at import, so `envDisabled` says what this process was started with. */
+async function testHttpTransportSelection(
+  modules: TestModules,
+  backend: TestCursorBackend,
+  envDisabled: boolean,
+) {
+  console.log(`[test] Testing HTTP transport selection (CURSOR_DISABLE_HTTP2=${envDisabled ? "1" : "unset"})...`);
+  const fromEnv = envDisabled ? "h1" : "h2";
+  await expectPluginTransport(modules, backend, { disableHttp2: true }, "h1", "option true");
+  await expectPluginTransport(modules, backend, { disableHttp2: false }, "h2", "option false");
+  await expectPluginTransport(modules, backend, {}, fromEnv, "no option");
+  await expectPluginTransport(modules, backend, { disableHttp2: "true" }, fromEnv, "non-boolean option");
+  console.log("[test] HTTP transport selection OK");
+}
+
+async function testHttpTransportFromEnv() {
+  console.log("[test] Testing CURSOR_DISABLE_HTTP2=1 in a fresh process...");
+  const child = Bun.spawn([process.execPath, import.meta.path], {
+    env: { ...process.env, CURSOR_DISABLE_HTTP2: "1", SMOKE_ENV_HTTP2_ONLY: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  assertEqual(code, 0, `Expected the CURSOR_DISABLE_HTTP2=1 run to pass:\n${out}\n${err}`);
+  console.log("[test] CURSOR_DISABLE_HTTP2=1 OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1095,8 +1531,17 @@ async function main() {
   const modules = await loadModules();
 
   try {
+    if (process.env.SMOKE_ENV_HTTP2_ONLY) {
+      await testHttpTransportSelection(modules, backend, true);
+      process.exitCode = 0;
+      return;
+    }
+    await testBridgeFraming();
+    await testHttp1WireFormat();
     await testProxyStartStop(modules);
+    await testStreamingFrameParser();
     await testStreamCancellationStopsBridge(modules, backend);
+    await testHttp1StreamCancellationAndStop(modules, backend);
     await testCancelPausedBridgeKeepsBridge(modules, backend);
     await testStopProxyClearsPausedBridges(modules, backend);
     await testAuthParams(modules);
@@ -1105,6 +1550,8 @@ async function main() {
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testV2Plugin(modules, backend);
+    await testHttpTransportSelection(modules, backend, false);
+    await testHttpTransportFromEnv();
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

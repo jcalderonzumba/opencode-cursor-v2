@@ -51,6 +51,49 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
 Bun's `node:http2` support is not reliable against Cursor's API.
 
+### HTTP/1.1 fallback
+
+HTTP/2 stays the default. Use the HTTP/1.1 transport when the H2 bridge cannot
+connect, for example behind corporate proxies that block HTTP/2. Set the
+`disableHttp2` plugin option in the `plugins` array of `opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-cursor-oauth",
+      "options": { "disableHttp2": true }
+    }
+  ]
+}
+```
+
+`CURSOR_DISABLE_HTTP2=1` does the same when the option is omitted. An explicit
+`true` or `false` option wins over the environment variable; a value that is
+not a boolean is ignored. Model discovery and agent turns use the same
+transport.
+
+Unary RPCs such as model discovery are a plain HTTP/1.1 `POST` with
+`Content-Type: application/proto` and the raw protobuf body.
+
+Agent turns use Cursor's HTTP/1.1 fallback and do stream:
+
+- `POST /agent.v1.AgentService/RunSSE` with `Content-Type: application/connect+proto`,
+  header `x-cursor-streaming: true`, and one Connect envelope whose payload is
+  `BidiRequestId` (the same id as `x-request-id`).
+- The run request and every later client message (tool results, KV replies,
+  heartbeats) go to `POST /aiserver.v1.BidiService/BidiAppend`. The `data`
+  field is the hex encoding of an `AgentClientMessage`, and `request_id`
+  matches the `RunSSE` `x-request-id`. `append_seqno` starts at 0 for the run
+  request and increases by one for each message.
+
+The response is a stream of Connect envelopes. Cursor labels this response
+`text/event-stream`, but the bytes are still envelopes, not `data:` events.
+The proxy reads them as they arrive and emits OpenAI SSE chunks. A final
+envelope with flag `0x02` ends the stream. While the turn is open the proxy
+sends a client heartbeat on `BidiAppend` every 5 seconds.
+
 ## Architecture
 
 ```
