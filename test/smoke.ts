@@ -1,11 +1,14 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   AgentServerMessageSchema,
+  ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
   InteractionUpdateSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
 import { Credential, Integration } from "@opencode/plugin";
@@ -41,6 +44,9 @@ interface TestCursorBackend {
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
   setHoldRunStream: (hold: boolean) => void;
+  /** While holding, also emit an MCP tool call with this id; the stream answers the tool result and ends. */
+  setRunStreamToolCall: (toolCallId: string | undefined) => void;
+  getOpenRunStreamCount: () => number;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
@@ -123,6 +129,28 @@ function frameRunTextDelta(text: string): Buffer {
   );
 }
 
+/** A Connect-framed MCP tool call, which makes the proxy pause the stream for a tool result. */
+function frameRunToolCall(toolCallId: string): Buffer {
+  return frameConnectUnaryMessage(
+    toBinary(
+      AgentServerMessageSchema,
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "execServerMessage",
+          value: create(ExecServerMessageSchema, {
+            id: 1,
+            execId: "exec-1",
+            message: {
+              case: "mcpArgs",
+              value: create(McpArgsSchema, { name: "echo", toolName: "echo", toolCallId }),
+            },
+          }),
+        },
+      }),
+    ),
+  );
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
@@ -133,6 +161,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let runStreamClosed = Promise.withResolvers<void>();
   const heldRunStreams = new Set<http2.ServerHttp2Stream>();
   let holdRunStream = false;
+  let runStreamToolCallId: string | undefined;
   const refreshAuthHeaders: string[] = [];
 
   const refreshServer = http.createServer((req, res) => {
@@ -182,6 +211,25 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         // first body byte, so emit one to unblock the caller's fetch.
         heldRunStreams.add(stream);
         stream.write(frameRunTextDelta("streaming"));
+        if (runStreamToolCallId) {
+          stream.write(frameRunToolCall(runStreamToolCallId));
+          // Answer the tool result (and only that; heartbeats are ignored) to
+          // prove the continuation reached this very stream.
+          let pending = Buffer.alloc(0);
+          stream.on("data", (chunk) => {
+            pending = Buffer.concat([pending, Buffer.from(chunk)]);
+            while (pending.length >= 5) {
+              const len = pending.readUInt32BE(1);
+              if (pending.length < 5 + len) break;
+              const message = fromBinary(AgentClientMessageSchema, pending.subarray(5, 5 + len));
+              pending = pending.subarray(5 + len);
+              if (message.message.case === "execClientMessage") {
+                stream.write(frameRunTextDelta("after-tool"));
+                stream.end();
+              }
+            }
+          });
+        }
       } else {
         stream.end();
       }
@@ -259,6 +307,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       if (!hold) {
         for (const stream of heldRunStreams) stream.close();
       }
+    },
+    setRunStreamToolCall(toolCallId) {
+      runStreamToolCallId = toolCallId;
+    },
+    getOpenRunStreamCount() {
+      return heldRunStreams.size;
     },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
@@ -403,6 +457,122 @@ async function testStreamCancellationStopsBridge(
     backend.setHoldRunStream(false);
   }
   console.log("[test] SSE cancellation teardown OK");
+}
+
+async function waitFor(condition: () => boolean, message: string) {
+  await withTimeout(
+    (async () => {
+      while (!condition()) await new Promise((resolve) => setTimeout(resolve, 20));
+    })(),
+    message,
+  );
+}
+
+function postChat(port: number, messages: unknown[], signal: AbortSignal) {
+  return fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "composer-2", stream: true, messages }),
+    signal,
+  });
+}
+
+/** Read an SSE response until [DONE]; the stream is paused for a tool call by then. */
+async function readUntilDone(res: Response): Promise<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  while (!text.includes("[DONE]")) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  return text;
+}
+
+const toolCallMessages = (toolCallId: string, withResult: boolean) => [
+  { role: "user", content: "run a tool" },
+  ...(withResult
+    ? [
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ id: toolCallId, type: "function", function: { name: "echo", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: toolCallId, content: "tool output" },
+      ]
+    : []),
+];
+
+async function testCancelPausedBridgeKeepsBridge(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing client disconnect on a paused bridge...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamToolCall("call-paused");
+  const first = new AbortController();
+  const second = new AbortController();
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const res = await postChat(port, toolCallMessages("call-paused", false), first.signal);
+    const paused = await readUntilDone(res);
+    assert(paused.includes("call-paused"), `Expected the tool call in the stream, got: ${paused}`);
+
+    first.abort();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assertEqual(backend.getOpenRunStreamCount(), 1, "Paused bridge must survive the disconnect");
+
+    const resumed = await postChat(port, toolCallMessages("call-paused", true), second.signal);
+    assertEqual(resumed.status, 200, "Expected the continuation to succeed");
+    const body = await withTimeout(resumed.text(), "the continuation response to finish");
+    assert(body.includes("after-tool"), `Expected the tool result to reach the same stream, got: ${body}`);
+  } finally {
+    first.abort();
+    second.abort();
+    modules.stopProxy();
+    backend.setRunStreamToolCall(undefined);
+    backend.setHoldRunStream(false);
+  }
+  console.log("[test] Paused bridge disconnect OK");
+}
+
+async function testStopProxyClearsPausedBridges(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing stopProxy with a paused bridge...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamToolCall("call-reused");
+  const controller = new AbortController();
+  try {
+    let port = await modules.startProxy(async () => "test-token");
+    const first = await readUntilDone(
+      await postChat(port, toolCallMessages("call-reused", false), controller.signal),
+    );
+    assert(first.includes("call-reused"), `Expected the tool call, got: ${first}`);
+    assertEqual(backend.getOpenRunStreamCount(), 1, "Expected one paused bridge");
+
+    modules.stopProxy();
+    await withTimeout(
+      backend.waitForRunStreamClose(),
+      "the paused bridge to be killed by stopProxy",
+    );
+
+    port = await modules.startProxy(async () => "test-token");
+    const again = await readUntilDone(
+      await postChat(port, toolCallMessages("call-reused", false), controller.signal),
+    );
+    assert(again.includes("call-reused"), `Expected the reused tool-call id to be accepted, got: ${again}`);
+  } finally {
+    controller.abort();
+    modules.stopProxy();
+    backend.setRunStreamToolCall(undefined);
+    backend.setHoldRunStream(false);
+  }
+  console.log("[test] stopProxy paused bridge cleanup OK");
 }
 
 async function testAuthParams(modules: TestModules) {
@@ -927,6 +1097,8 @@ async function main() {
   try {
     await testProxyStartStop(modules);
     await testStreamCancellationStopsBridge(modules, backend);
+    await testCancelPausedBridgeKeepsBridge(modules, backend);
+    await testStopProxyClearsPausedBridges(modules, backend);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testArrayContentParsing(modules);

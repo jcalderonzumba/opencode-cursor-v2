@@ -522,7 +522,8 @@ export function stopProxy(): void {
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {
     clearInterval(active.heartbeatTimer);
-    active.bridge.end();
+    // end() only half-closes the request; killing also stops the response.
+    try { active.bridge.proc.kill(); } catch {}
   }
   activeBridges.clear();
   conversationStates.clear();
