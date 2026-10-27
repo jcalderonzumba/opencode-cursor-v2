@@ -6,7 +6,7 @@ import {
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
-import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
+import { Credential, Integration } from "@opencode/plugin";
 import type CursorV2PluginModule from "../src/v2";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
@@ -29,8 +29,9 @@ type IntegrationTransform = Parameters<
 >[0];
 type IntegrationDraft = Parameters<IntegrationTransform>[0];
 type IntegrationMethod = Parameters<IntegrationDraft["method"]["update"]>[0];
-type CatalogTransform = Parameters<V2Context["catalog"]["transform"]>[0];
-type CatalogDraft = Parameters<CatalogTransform>[0];
+type ProviderTransform = Parameters<V2Context["provider"]["transform"]>[0];
+type ProviderDraft = Parameters<ProviderTransform>[0];
+type ProviderInfo = Parameters<ProviderDraft["add"]>[0]["info"];
 
 interface TestCursorBackend {
   apiUrl: string;
@@ -358,12 +359,11 @@ async function testV2Plugin(
   ]);
 
   let integrationTransform: IntegrationTransform | undefined;
-  let catalogTransform: CatalogTransform | undefined;
+  let providerTransform: ProviderTransform | undefined;
   let authMethod: IntegrationMethod | undefined;
   let integrationName: string | undefined;
-  let providerPackage: string | undefined;
-  let providerIntegrationID: string | undefined;
-  let providerBaseURL: unknown;
+  let providerInfo: ProviderInfo | undefined;
+  let providerReloads = 0;
   const modelIDs: string[] = [];
 
   const integration = { id: "cursor", name: "cursor" };
@@ -391,42 +391,23 @@ async function testV2Plugin(
     },
   };
 
-  const catalogDraft: CatalogDraft = {
-    provider: {
-      list() {
-        return [];
-      },
-      get() {
-        return undefined;
-      },
-      update(id, update) {
-        const provider = Provider.Info.empty(Provider.ID.make(id));
-        update(provider);
-        providerPackage = provider.package;
-        providerIntegrationID = provider.integrationID;
-        providerBaseURL = provider.settings?.baseURL;
-      },
-      remove() {},
+  const providerDraft: ProviderDraft = {
+    list() {
+      return [];
     },
-    model: {
-      get() {
-        return undefined;
-      },
-      update(providerID, modelID, update) {
-        const model = Model.Info.default(
-          Provider.ID.make(providerID),
-          Model.ID.make(modelID),
-        );
-        update(model);
-        modelIDs.push(model.id);
-      },
+    get() {
+      return undefined;
+    },
+    add(input) {
+      providerInfo = input.info;
+      for (const model of input.models) modelIDs.push(model.id);
+    },
+    update() {},
+    remove() {},
+    models: {
+      set() {},
+      update() {},
       remove() {},
-      default: {
-        get() {
-          return undefined;
-        },
-        set() {},
-      },
     },
   };
 
@@ -438,7 +419,7 @@ async function testV2Plugin(
     return Promise.race([
       pending.promise,
       Bun.sleep(500).then(() => {
-        throw new Error("Expected V2 catalog reload");
+        throw new Error("Expected V2 provider reload");
       }),
     ]);
   }
@@ -450,30 +431,44 @@ async function testV2Plugin(
     access: "expired-access",
     expires: Date.now() - 1,
   });
-  const connectionEvent = {
-    id: "cursor-connection-updated",
+  type TestEvent =
+    | { id: string; created: number; type: "credential.updated"; data: {} }
+    | {
+        id: string;
+        created: number;
+        type: "credential.switched";
+        data: { integrationID: string; credentialID: string | null };
+      };
+  const credentialUpdated: TestEvent = {
+    id: "credential-updated",
     created: Date.now(),
-    type: "integration.connection.updated" as const,
-    data: { integrationID: "cursor" },
+    type: "credential.updated",
+    data: {},
   };
+  function credentialSwitched(integrationID: string): TestEvent {
+    return {
+      id: `credential-switched-${integrationID}`,
+      created: Date.now(),
+      type: "credential.switched",
+      data: { integrationID, credentialID: null },
+    };
+  }
   let eventClosed = false;
-  const eventQueue: Array<typeof connectionEvent> = [];
-  let sendEvent:
-    | ((result: IteratorResult<typeof connectionEvent>) => void)
-    | undefined;
-  function emitUpdate(): void {
+  const eventQueue: TestEvent[] = [];
+  let sendEvent: ((result: IteratorResult<TestEvent>) => void) | undefined;
+  function emit(event: TestEvent): void {
     if (sendEvent) {
       const send = sendEvent;
       sendEvent = undefined;
-      send({ done: false, value: connectionEvent });
+      send({ done: false, value: event });
       return;
     }
-    eventQueue.push(connectionEvent);
+    eventQueue.push(event);
   }
   const eventStream = {
     [Symbol.asyncIterator]() {
       return {
-        next(): Promise<IteratorResult<typeof connectionEvent>> {
+        next(): Promise<IteratorResult<TestEvent>> {
           if (eventClosed) {
             return Promise.resolve({ done: true, value: undefined });
           }
@@ -485,7 +480,7 @@ async function testV2Plugin(
             sendEvent = resolve;
           });
         },
-        return(): Promise<IteratorResult<typeof connectionEvent>> {
+        return(): Promise<IteratorResult<TestEvent>> {
           eventClosed = true;
           sendEvent?.({ done: true, value: undefined });
           sendEvent = undefined;
@@ -526,20 +521,21 @@ async function testV2Plugin(
         },
       },
     },
-    catalog: {
-      async transform(transform: CatalogTransform) {
-        catalogTransform = transform;
+    provider: {
+      async transform(transform: ProviderTransform) {
+        providerTransform = transform;
         return { async dispose() {} };
       },
       async reload() {
+        providerReloads++;
         modelIDs.length = 0;
-        assert(catalogTransform, "Expected V2 catalog transform");
-        catalogTransform(catalogDraft);
+        assert(providerTransform, "Expected V2 provider transform");
+        providerTransform(providerDraft);
         markReload?.();
         markReload = undefined;
         if (failReload) {
           failReload = false;
-          throw new Error("Injected catalog reload failure");
+          throw new Error("Injected provider reload failure");
         }
       },
     },
@@ -550,7 +546,7 @@ async function testV2Plugin(
     },
   };
 
-  // SAFETY: The plugin only reads the integration, catalog, and event domains
+  // SAFETY: The plugin only reads the integration, provider, and event domains
   // supplied by this public-entrypoint harness.
   const cleanup = await modules.CursorV2Plugin.setup(
     context as unknown as V2Context,
@@ -558,12 +554,21 @@ async function testV2Plugin(
   assert(integrationTransform, "Expected V2 integration transform");
   failReload = true;
   const failedReload = waitForReload();
-  emitUpdate();
+  emit(credentialUpdated);
   await failedReload;
 
   const retry = waitForReload();
-  emitUpdate();
+  emit(credentialSwitched("cursor"));
   await retry;
+
+  const reloadsBeforeOther = providerReloads;
+  emit(credentialSwitched("other"));
+  await Bun.sleep(50);
+  assertEqual(
+    providerReloads,
+    reloadsBeforeOther,
+    "Expected credential.switched for another integration to be ignored",
+  );
   assertArrayEqual(
     backend.getRefreshAuthHeaders(),
     ["Bearer valid-refresh"],
@@ -587,24 +592,27 @@ async function testV2Plugin(
     "Expected Cursor OAuth method",
   );
   assertEqual(authMethod.method.type, "oauth", "Expected OAuth method type");
+  assert(providerInfo, "Expected V2 provider info");
   assertEqual(
-    providerIntegrationID,
+    providerInfo.integrationID,
     "cursor",
     "Expected Cursor provider integration",
   );
   assertEqual(
-    providerPackage,
-    "@opencode-ai/ai/providers/openai-compatible",
+    providerInfo.package,
+    "@opencode/ai/providers/openai-compatible",
     "Expected V2 OpenAI-compatible provider",
   );
-  assert(
-    typeof providerBaseURL === "string",
-    "Expected V2 provider base URL",
+  const providerBaseURL = providerInfo.settings?.baseURL;
+  assertEqual(
+    providerBaseURL,
+    `http://localhost:${modules.getProxyPort()}/v1`,
+    "Expected V2 provider base URL to point at the local proxy",
   );
   assertArrayEqual(
     modelIDs.sort(),
     ["auto", "v2-model"],
-    "Expected V2 catalog models",
+    "Expected V2 provider models",
   );
 
   const modelsResponse = await fetch(`${providerBaseURL}/models`);
@@ -640,7 +648,7 @@ async function testV2Plugin(
 
   connected = false;
   const stopped = waitForReload();
-  emitUpdate();
+  emit(credentialUpdated);
   await stopped;
   assertEqual(
     modules.getProxyPort(),
