@@ -32,7 +32,7 @@ Two variants. `/run-phase` fills the sections it can and leaves *Code-review ver
 
 ## Deviations
 
-<Every change outside the phase's text, or "none".>
+<Every change outside the phase's text, each with its justification, or "none".>
 
 ## Executor-level decisions
 
@@ -78,7 +78,7 @@ Drops *Review-plan verdict*, *Task coverage* and *Executor-level decisions*.
 
 ## Deviations
 
-<Every change outside the stated purpose, or "none".>
+<Every change outside the stated purpose, each with its justification, or "none".>
 
 ## Rulings
 

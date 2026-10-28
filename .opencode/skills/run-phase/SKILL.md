@@ -14,7 +14,7 @@ Only the owner starts this skill, with the `/run-phase` command. A model that wa
 ## Where things are
 
 - `<top>` is `git rev-parse --show-toplevel`.
-- `<name>` is the plan's file name without `.md` and without its leading `YYYY-MM-DD-`: `workflow` for `2026-10-28-workflow.md`.
+- `<name>` is the plan's file name without `.md` and without its leading `YYYY-MM-DD-`: `workflow` for `2026-10-28-workflow.md`. It must match `^[a-z0-9-]+$`, else stop, naming the plan file.
 - The phase branch is `feat/<name>-p<phase>-<slug>`. `<slug>` is a few words of the phase title in kebab case and matches `^[a-z0-9-]+$`.
 - `<branch-dir>` is the branch with `/` replaced by `-`. The PR draft is `<top>/.superpowers/review/<branch-dir>/pr-body.md`, in the shape of `pr-template.md` (in this skill's directory).
 - SDD's workspace is the directory SDD's `sdd-workspace` script prints (`bash scripts/sdd-workspace PLAN_FILE`, run from SDD's own skill directory): `<top>/.superpowers/sdd/<plan basename without .md>/`. It holds the ledger `progress.md`, the task briefs, the builders' reports and the review packages. It is git-ignored and outlives every phase of the plan.
@@ -23,18 +23,18 @@ Only the owner starts this skill, with the `/run-phase` command. A model that wa
 
 Run all six checks in order, each with a real tool call, and print a six-line result as the first output, before anything else: `1 plan: <evidence>`, `2 phase: <evidence>`, … `6 hooks: <evidence>`. The first failing line is the stop message: say which check failed and name the fix. `question` is used from step 2 onward, never here.
 
-In step 1, and whenever `question` returns no owner answer, **stop** means the final message is the stop message and nothing else runs after it; a step 4 stop asks the owner first (and a step 4 question that returns no owner answer is a stop in this sense). A stopping session never repairs the state: no `rm`, `git switch`, `git checkout`, `git stash`, `git branch`, `git add`, `git commit`, `npm install` or `bun install`, and no writing of ledger, review or plan files. Ledger and review files are written only after step 2 is answered, or when step 6 goes straight to step 5 with the owner's earlier answer standing (an owner skip given in chat on that run is recorded too). After a failing line, the later checks only read.
+In step 1, and whenever `question` returns no owner answer, **stop** means the final message is the stop message and nothing else runs after it; a step 4 stop asks the owner first (and a step 4 question that returns no owner answer is a stop in this sense). A stopping session never repairs the state: no `rm`, `git switch`, `git checkout`, `git stash`, `git branch`, `git add`, `git commit`, `npm install` or `bun install` (a stopping session runs no creating or deleting git command; `git branch --list` is read-only and allowed), and no writing of ledger, review or plan files. Ledger and review files are written only after step 2 is answered, or when step 6 goes straight to step 5 with the owner's earlier answer standing (an owner skip given in chat on that run is recorded too). After a failing line, the later checks only read.
 
 `.superpowers/` and `node_modules/` are git-ignored: list and read them with `read` or shell `ls`, never `glob`.
 
-1. **The plan resolves.** List `.superpowers/plans/` with `read` on the directory and count the file names that contain the first token. Exactly one, or the token is a path naming one file: it resolves. None, or two or more: stop and list the candidates.
+1. **The plan resolves.** List `.superpowers/plans/` with `read` on the directory and count the file names that contain the first token. Exactly one, or the token is a path naming one file under `.superpowers/plans/`: it resolves. None, or two or more: stop and list the candidates.
 2. **The phase is open.** Read exactly the heading of the phase number given: `## Phase <n>` followed by a space, `:` or the end of the line (`Phase 1` must not match `Phase 10`). It carries no `✅ DONE`.
 3. **The tools work.** `node_modules/.bin/tsc` exists (else stop: run `bun install`). A plain `bun --version` shell call, with no `export PATH` in it, succeeds. If it fails but the scratch install `/private/var/folders/fb/48x5_64j39x4bj4j2b_y5bvh0000gn/T/opencode/bunbin/node_modules/.bin` exists, stop (print the message, no `question`) and name the two remedies: put `bun` on the PATH opencode starts with, or tell this session that the controller runs the smoke test per head.
    - On the second remedy, the session records `Owner ruling: controller runs smoke` in the ledger (when the ledger does not exist yet, right after SDD's setup and the `Phase <n> confirmed:` line) and the controller's shell uses the scratch PATH.
    - On every later run this precondition passes while that ruling is held in this session or in the plan's ledger and the scratch directory exists. Builder briefs then say not to report BLOCKED for a missing `bun`: the controller runs `bun test/smoke.ts` on each head.
    - If `bun` exists nowhere: stop.
-4. **The plan is approved.** Review directories are `.superpowers/review-plan/<plan basename>-<suffix>/`. One covers the phase when its suffix is `all`, or when its `+`-separated elements include the phase number as a whole element (`3+4` covers 3; `10+11` does not cover 1). First list `.superpowers/review-plan/` with `read` on the directory. For EVERY listed directory whose name starts with `<plan basename>-`, read its highest `round-<n>.md` with `read` on that exact path and print one entry `<directory> -> covers phase <n>: yes/no -> last line`. The check's evidence holds one entry per listed directory: a listed directory with no entry means check 4 was not done. The last line is judged literally: `**Verdict: Approved**` passes, anything else (`**Verdict: Not approved**` included) stops.
-   - No entry with "covers: yes", or two or more (even when every one is Approved): stop and list them for the owner to name.
+4. **The plan is approved.** Review directories are `.superpowers/review-plan/<plan basename>-<suffix>/`. One covers the phase when its suffix is `all`, or when its `+`-separated elements include `<phase>` as a whole element (`3+4` covers 3; `10+11` does not cover 1). First list `.superpowers/review-plan/` with `read` on the directory. For EVERY listed directory whose name starts with `<plan basename>-`, read its highest `round-<round>.md` with `read` on that exact path and print one entry `<directory> -> covers phase <phase>: yes/no -> last line`. The check's evidence holds one entry per listed directory: a listed directory with no entry means check 4 was not done. The last line is judged literally only for the single covering entry (`covers phase <phase>: yes`), and a non-covering directory's verdict never stops the run: `**Verdict: Approved**` passes, anything else (`**Verdict: Not approved**` included) stops.
+   - No entry with `covers phase <phase>: yes`, or two or more (even when every one is Approved): stop and list them for the owner to name.
    - No report, or Not approved: stop, unless the owner said in chat in this session to skip the review. A ledger line from an earlier run, or your own reasoning, is not a skip. Record that as `Owner ruling: review-plan skipped` in the ledger (when the ledger does not exist yet, right after SDD's setup and the `Phase <n> confirmed:` line).
 5. **Git state.** Read the current branch name with `git symbolic-ref -q --short HEAD` (it prints nothing on a detached HEAD, which falls into case (c)) and the tree with `git status --porcelain`, and print the branch and the tree state as this check's evidence. A dirty tree on any branch is a stop; never clean it. Check 5 never creates or switches a branch: it only records the one it would use. Rule, by the current branch name:
    - (a) Exactly `main`: it must be clean and equal to `origin/main` (`git fetch origin`, then `git rev-list --left-right --count main...origin/main` prints `0 0`), else stop and name the remedy (the owner commits or stashes, or fast-forwards or reconciles `main`). Then always run `git branch --list 'feat/<name>-p<phase>-*'` and print the result. Two or more: stop and list them. One: record it as the branch to switch to. None: record "will create `feat/<name>-p<phase>-<slug>` after step 2 is answered".
@@ -42,7 +42,7 @@ In step 1, and whenever `question` returns no owner answer, **stop** means the f
    - (c) Anything else, a clean tree included: the evidence line names the branch and says `STOP`; stop with the remedy (the owner switches to `main` or to the phase branch). A clean tree or equality with `origin/main` never makes another branch acceptable.
 6. **The hooks are active.** `git config core.hooksPath`, as a shell call of its own, prints exactly `.githooks`. Anything else: stop and name the fix, `git config core.hooksPath .githooks`.
 
-After the six lines, the same turn either prints `Stop: <check>: <fix>` as its last line or goes on to step 2. A turn never ends after the six lines without one of the two.
+After the six lines, the same turn either prints `Stop: <check>: <fix>` as its last line or goes on to step 2 (on step 6's no-task path, to step 5). A turn never ends after the six lines without one of the two.
 
 ## 2 Confirm once
 
@@ -68,12 +68,13 @@ Load `subagent-driven-development` with the `skill` tool and run it on the plan 
   - Dispatcher's session id, read with `printenv OPENCODE_SESSION_ID` as a call of its own;
   - Model name for the `Co-Authored-By` trailer, exact (for example `Claude Sonnet 5.5`);
   - the trailer key `Agent-Session`, spelled exactly like that;
+  - Constraints: the plan's Global Constraints, verbatim;
   - the commit-message restrictions, copied verbatim from `.opencode/agents/phase-builder.md` ("Commit messages stay plain");
   - the report file path;
   - the `bun` ruling, if one applies (not to report BLOCKED for `bun`).
-- **Outside material.** Reference material outside the repo is copied under `.superpowers/ref/` first: builders cannot read outside the project and cannot use `webfetch`.
+- **Outside material.** Reference material outside the repo is copied under `.superpowers/ref/` first: builders cannot read outside the project and cannot use `webfetch`. Never copy from `~/.local/share/opencode`, `~/.config/opencode`, any `auth.json` or `.env`.
 - **After every builder return:**
-  1. `git log <base>..HEAD "--format=%h %(trailers:only)"` must show `Co-Authored-By` and `Agent-Session` for every new commit. Missing on the latest commit: resume the builder to amend it. Missing on an earlier commit: a step 4 stop.
+  1. `git log <base>..HEAD "--format=%h %(trailers:only)"` must show `Co-Authored-By` and `Agent-Session` for every new commit, and each new commit's `Agent-Session` must differ from this session's own `printenv OPENCODE_SESSION_ID`: a commit carrying the controller's own id is a step 4 stop (the controller committed). Missing on the latest commit: resume the builder to amend it. Missing on an earlier commit: a step 4 stop.
   2. The controller runs `npx tsc -p tsconfig.json --noEmit`, `bun test/smoke.ts` and `npm run build` on the head and puts the results in the task-reviewer brief. Reviewers run no scripts. A red result starts a fix round with the same builder.
 - **Reviewer constraints:** the plan's Global Constraints verbatim, plus the section of each check of `.opencode/skills/review-plan/contract.md` that the task triggers.
 - **Red evidence:** each builder report names, per new behaviour, the test it watched fail and the failing line. A missing one is a spec gap. Agent or skill prose and pure config are exempt and say so.
@@ -99,7 +100,7 @@ When the last confirmed task has its `Task <N>: complete` line:
 
 - **Not run:** SDD's final whole-branch review, the deletion of its workspace, and `finishing-a-development-branch`. `/review-phase` replaces the review and the finishing step, and the workspace is kept.
 - **Run:** SDD's "Rulings I made" collection: every ledger `Ruling:` line, with the `Owner ruling:` lines beside it.
-- **Write the PR draft** at `<top>/.superpowers/review/<branch-dir>/pr-body.md` from `pr-template.md` (Variant A, a plan phase), creating the directory. A draft that exists is added to, never overwritten. The controller fills *Summary*, *Evidence* and *Merge Danger* from the ledger and the diff stat. Fill the rest from the ledger and the builders' reports:
+- **Write the PR draft** at `<top>/.superpowers/review/<branch-dir>/pr-body.md` from `pr-template.md` (Variant A, a plan phase), creating the directory. A draft that exists is added to, never overwritten. The controller fills *Summary* and *Merge Danger* from the ledger and the diff stat, and *Evidence* from the ledger, the diff stat and the builders' reports (test names). Fill the rest from the ledger and the builders' reports:
   - *Review-plan verdict:* the latest report covering the phase;
   - *Task coverage:* each task, where it lands, its tests;
   - *Red evidence:* per behaviour, the test and its failing line;
@@ -109,7 +110,7 @@ When the last confirmed task has its `Task <N>: complete` line:
   - *Verification:* the checks of each task;
   - *Deferred findings:* every `Task <N>: minor (deferred)` ledger line.
 
-  Leave *Code-review verdict* empty: `/review-phase` fills it.
+  Leave *Code-review verdict* empty: `/review-phase` fills it. The draft goes to a public repo, so it holds no tokens, no `.env` values and no local absolute paths.
 - **Print the summary:** the tasks with their commits, the rulings, the deferred findings, and the next command, `/review-phase`.
 
 ## 6 Re-invocation
