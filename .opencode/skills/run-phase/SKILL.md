@@ -31,10 +31,10 @@ In order. Stop at the first that fails, say which, and name the fix. A precondit
    - If `bun` exists nowhere: stop.
 4. **The plan is approved.** Review directories are `.superpowers/review-plan/<plan basename>-<suffix>/`. One covers the phase when its suffix is `all`, or when its `+`-separated elements include the phase number as a whole element (`3+4` covers 3; `10+11` does not cover 1). Take the highest `round-<n>.md` of each covering directory: its last line must be `**Verdict: Approved**`.
    - More than one covering directory: stop and list them for the owner to name.
-   - No report, or Not approved: stop, unless the owner says in chat to skip the review. Record that as `Owner ruling: review-plan skipped`.
+   - No report, or Not approved: stop, unless the owner says in chat to skip the review. Record that as `Owner ruling: review-plan skipped` in the ledger (when the ledger does not exist yet, right after SDD's setup and the `Phase <n> confirmed:` line).
 5. **Git state.** Read the branch with `git symbolic-ref -q HEAD` and the tree with `git status --porcelain`.
-   - On `main` with a clean tree: list `git branch --list 'feat/<name>-p<phase>-*'`. One: switch to it with `git switch`. None: create it with `git switch -c` after step 2, and the confirmation shows its name. More than one: stop and list them.
-   - Already on a branch `feat/<name>-p<phase>-*`: continue.
+   - On `main`, with a clean tree and equal to `origin/main` (`git fetch origin`, then `git rev-list --left-right --count main...origin/main` prints `0 0`): list `git branch --list 'feat/<name>-p<phase>-*'`. One: switch to it with `git switch`. None: create it with `git switch -c` after step 2, and the confirmation shows its name. More than one: stop and list them. A dirty tree or a `main` that differs from `origin/main`: stop and name the remedy (commit or stash, or fast-forward or reconcile `main`).
+   - Already on a branch `feat/<name>-p<phase>-*` with a clean tree: continue.
    - Anywhere else, or a dirty tree: stop and name the remedy (commit or stash, or switch to `main` or to the phase branch).
 6. **The hooks are active.** `git config core.hooksPath`, as a shell call of its own, prints exactly `.githooks`. Anything else: stop and name the fix, `git config core.hooksPath .githooks`.
 
@@ -42,7 +42,7 @@ In order. Stop at the first that fails, say which, and name the fix. A precondit
 
 Read the phase and print:
 
-- one row per unticked task (a `### Task` with a `- [ ]` step): its title, its files, and the deferred minors carried into it;
+- one row per unticked task (a `### Task` with a `- [ ]` step): its title, its files, and the deferred minors carried into it. On a re-invocation the ledger's `Task <N>: complete` lines win over unticked plan steps: a completed task is not a row;
 - the branch the run uses or will create;
 - the owner's hands: anything only the owner can do (a key, an owner-led step, a run on another machine);
 - the builder and reviewer models: the `model` of `.opencode/agents/phase-builder.md` and `.opencode/agents/task-reviewer.md`.
@@ -68,7 +68,7 @@ Load `subagent-driven-development` with the `skill` tool and run it on the plan 
 - **Outside material.** Reference material outside the repo is copied under `.superpowers/ref/` first: builders cannot read outside the project and cannot use `webfetch`.
 - **After every builder return:**
   1. `git log <base>..HEAD "--format=%h %(trailers:only)"` must show `Co-Authored-By` and `Agent-Session` for every new commit. Missing on the latest commit: resume the builder to amend it. Missing on an earlier commit: stop and tell the owner.
-  2. The controller runs `npx tsc -p tsconfig.json --noEmit`, `bun test/smoke.ts` and `npm run build` on the head and puts the results in the task-reviewer brief. Reviewers run no scripts.
+  2. The controller runs `npx tsc -p tsconfig.json --noEmit`, `bun test/smoke.ts` and `npm run build` on the head and puts the results in the task-reviewer brief. Reviewers run no scripts. A red result starts a fix round with the same builder.
 - **Reviewer constraints:** the plan's Global Constraints verbatim, plus the section of each check of `.opencode/skills/review-plan/contract.md` that the task triggers.
 - **Red evidence:** each builder report names, per new behaviour, the test it watched fail and the failing line. A missing one is a spec gap. Agent or skill prose and pure config are exempt and say so.
 - **The controller commits nothing.** Only builders commit code.
@@ -93,11 +93,11 @@ When the last confirmed task has its `Task <N>: complete` line:
 
 - **Not run:** SDD's final whole-branch review, the deletion of its workspace, and `finishing-a-development-branch`. `/review-phase` replaces the review and the finishing step, and the workspace is kept.
 - **Run:** SDD's "Rulings I made" collection: every ledger `Ruling:` line, with the `Owner ruling:` lines beside it.
-- **Write the PR draft** at `<top>/.superpowers/review/<branch-dir>/pr-body.md` from `pr-template.md`, creating the directory. A draft that exists is added to, never overwritten. Fill it from the ledger and the builders' reports:
+- **Write the PR draft** at `<top>/.superpowers/review/<branch-dir>/pr-body.md` from `pr-template.md` (Variant A, a plan phase), creating the directory. A draft that exists is added to, never overwritten. The controller fills *Summary*, *Evidence* and *Merge Danger* from the ledger and the diff stat. Fill the rest from the ledger and the builders' reports:
   - *Review-plan verdict:* the latest report covering the phase;
   - *Task coverage:* each task, where it lands, its tests;
   - *Red evidence:* per behaviour, the test and its failing line;
-  - *Deviations:* every change outside the phase's text, or "none";
+  - *Deviations:* every change outside the phase's text, plus the `Owner ruling: controller runs smoke` relaxation (amendment A3) when held, or "none";
   - *Executor-level decisions:* each with why;
   - *Rulings:* "Rulings I made" and the owner's rulings;
   - *Verification:* the checks of each task;
@@ -108,7 +108,7 @@ When the last confirmed task has its `Task <N>: complete` line:
 
 ## 6 Re-invocation
 
-`/run-phase` on a partly built phase resumes. The preconditions run again, the skill shows the remaining list, asks the one question again, appends a second `Phase <n> confirmed:` line and resumes at the first confirmed task with no `Task <N>: complete` line.
+`/run-phase` on a partly built phase resumes. The preconditions run again, the skill shows the remaining list (ledger `Task <N>: complete` lines win over unticked plan steps), asks the one question again, appends a second `Phase <n> confirmed:` line and resumes at the first confirmed task with no `Task <N>: complete` line. If no confirmed task lacks a `complete` line, say so and go to step 5 without asking.
 
 ## Never
 

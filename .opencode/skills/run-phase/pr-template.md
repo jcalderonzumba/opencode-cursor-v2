@@ -44,7 +44,7 @@ Two variants. `/run-phase` fills the sections it can and leaves *Code-review ver
 
 ## Verification
 
-<The checks each task ran and their results: tsc, smoke, build.>
+<The checks each task ran and their results: tsc, smoke, build. Live verification of outside facts, the verified host version, and the unverified surfaces.>
 
 ## Code-review verdict
 
@@ -86,7 +86,7 @@ Drops *Review-plan verdict*, *Task coverage* and *Executor-level decisions*.
 
 ## Verification
 
-<The checks run and their results: tsc, smoke, build.>
+<The checks run and their results: tsc, smoke, build. Live verification of outside facts, the verified host version, and the unverified surfaces.>
 
 ## Code-review verdict
 
