@@ -23,7 +23,7 @@ Apply every check of `.opencode/skills/review-plan/contract.md` with its trigger
 
 1. **The phase landed as planned.** Every task of the phase under review (or the stated purpose, for `no plan phase`) is present in the diff, and every change outside the phase's text is declared in the PR draft's Deviations. **Must Fix**: a planned task missing or only partly landed, or an undeclared deviation.
 2. **Trailers.** Every commit of `<base>..<head>` carries a `Co-Authored-By` and an `Agent-Session` trailer: `git log <base>..<head> "--format=%h %(trailers:only)"`. **Must Fix**: a commit without either.
-3. **Session independence.** Each commit's `Agent-Session` differs from the dispatcher's session id, read from the `Dispatcher's session id: <id>` line in the ledger's `progress.md`, beside the `Phase <n> confirmed:` line. **Must Fix**: a commit that carries the dispatcher's id (the controller committed).
+3. **Session independence.** Each commit's `Agent-Session` differs from every `Dispatcher's session id: <id>` line recorded for the phase in the ledger's `progress.md`, one after each `Phase <n> confirmed:` line (a re-invoked phase has one per controller). **Must Fix**: a commit that carries any of those ids (a controller committed).
 
 Check 3 is skipped, with that reason, when the brief names no SDD ledger, as it does for `no plan phase`, or when `progress.md` has no `Dispatcher's session id:` line. Checks 1 and 2 run for every branch.
 
