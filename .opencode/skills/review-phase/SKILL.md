@@ -145,4 +145,10 @@ There is no stamp: the report's last line is the record.
 
 ## 7 Landing
 
-The owner's word "land pr" starts it; the clerk never lands on its own. Load the `land-pr` skill and merge with `gh pr merge <n> -R jcalderonzumba/opencode-cursor-v2 --squash --match-head-commit <reviewed sha> --delete-branch`. Then sync the local `main` (`git switch main`, `git pull --ff-only`) and delete the local branch.
+The owner's word "land pr" starts it; the clerk never lands on its own. Load the `land-pr` skill for its checks, but not for its merge command.
+
+GitHub's squash puts its own `Co-authored-by` paragraph last and pushes the builders' `Agent-Session` lines above it, where git no longer reads them as trailers. So before the merge the clerk writes `<top>/.superpowers/review/<branch-dir>/squash-body.md`: one or two plain lines, a blank line, then **one** trailer paragraph holding every distinct non-blank line of `git log origin/main..<reviewed sha> "--format=%(trailers:only)"` (that format prints a blank line after each commit). Run `git interpret-trailers --parse <that file>`: it must list both `Co-Authored-By` and `Agent-Session`. A miss is fixed in the file, not in the merge.
+
+Then merge with `gh pr merge <n> -R jcalderonzumba/opencode-cursor-v2 --squash --match-head-commit <reviewed sha> --body-file <top>/.superpowers/review/<branch-dir>/squash-body.md --delete-branch`. This command replaces `land-pr` step 4, which has no `--body-file` and would reproduce the defect; `land-pr` lives outside this repo and is not edited here.
+
+Then sync the local `main` (`git switch main`, `git pull --ff-only`) and delete the local branch. `git log -1 "--format=%(trailers:only)"` on `main` must list both keys. A miss is told to the owner, and `main` is never rewritten. The squash commit on `main` is the authoritative record.
