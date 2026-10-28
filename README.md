@@ -3,17 +3,22 @@
 OpenCode plugin that connects to Cursor's API, giving you access to Cursor
 models inside OpenCode with full tool-calling support.
 
-## OpenCode V2 beta
+## OpenCode V2
+
+This plugin targets OpenCode V2 only. It was verified against OpenCode 2.1.4:
+the plugin loads and registers the `cursor` integration and its OAuth method.
+Model discovery and chat need a real Cursor login, which that check did not
+cover.
 
 Install the plugin:
 
 ```sh
-opencode2 plugin add opencode-cursor-oauth
+opencode plugin add opencode-cursor-oauth
 ```
 
 The command adds the package to your global V2 configuration.
 
-Start `opencode2`.
+Start `opencode`.
 Run `/connect`.
 Select Cursor.
 
@@ -35,8 +40,9 @@ You do not have to clone this repository.
 
 ## Use
 
-Start OpenCode and select any Cursor model. The plugin starts a local
-OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
+Start OpenCode and select any Cursor model. Once a Cursor login exists, the
+plugin starts a local OpenAI-compatible proxy and routes requests through
+Cursor's gRPC API.
 
 ## How it works
 
@@ -73,6 +79,9 @@ connect, for example behind corporate proxies that block HTTP/2. Set the
 `true` or `false` option wins over the environment variable; a value that is
 not a boolean is ignored. Model discovery and agent turns use the same
 transport.
+
+The HTTP/1.1 transport has only been tested against a fake backend, not a real
+blocking proxy.
 
 Unary RPCs such as model discovery are a plain HTTP/1.1 `POST` with
 `Content-Type: application/proto` and the raw protobuf body.
@@ -126,7 +135,8 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 
 Conversation history is rebuilt from the OpenAI messages on every request
 (`rootPromptMessagesJson` + content-addressed turn blobs), and server
-checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
+checkpoints are persisted to `~/.cache/opencode-cursor/conversations/`
+(`$XDG_CACHE_HOME/opencode-cursor/conversations/` when set) so
 context survives restarts. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
 handshake and exec traffic when debugging.
 
@@ -140,7 +150,7 @@ bun test/smoke.ts
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai)
+- [OpenCode](https://opencode.ai) V2 (2.1.4 verified)
 - [Bun](https://bun.sh)
 - [Node.js](https://nodejs.org) >= 18 for the HTTP/2 bridge process
 - Active [Cursor](https://cursor.com) subscription
