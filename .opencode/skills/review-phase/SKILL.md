@@ -130,18 +130,19 @@ On **Not approved**:
 
 ## 5 Disputes
 
-A finding this session believes is wrong is neither fixed nor silently ignored. It goes to the owner with both readings, this session's recommendation first. Append the owner's ruling to `<top>/.superpowers/review/<branch-dir>/rulings.md` (create it if absent) as `- <finding id>: <ruling> (<YYYY-MM-DD>)`. The next brief names the file. A ruling that changes a spec changes the spec in the same PR. Only the owner rules on a dispute.
+A finding this session believes is wrong is neither fixed nor silently ignored. It goes to the owner with both readings, this session's recommendation first. Append the owner's ruling to `<top>/.superpowers/review/<branch-dir>/rulings.md` (create it if absent) as `- <finding id>: <ruling> (<YYYY-MM-DD>)`. The next brief names the file. A ruling that changes a spec updates the spec in `.superpowers/specs/` (git-ignored, never committed) and is recorded in the PR draft's Rulings. Only the owner rules on a dispute.
 
 ## 6 On approval
 
 There is no stamp: the report's last line is the record.
 
-1. **The state held.** `git rev-parse HEAD` equals the brief's head and `git status --porcelain` prints nothing. Otherwise the approval is void: put the state back, or commit the change as a new head and run the next round.
-2. **Fill the PR draft's Code-review verdict:** the verdict, the reviewed head sha, the round count, the reviewer model and the report file name. Fill Verification with the checks of `checks.txt`.
-3. **Ask once.** Show the owner the branch, the sha and the PR body, and ask with the `question` tool: push the branch and open the PR as shown? A cancelled, unanswered or errored `question` is a stop. Nothing is pushed before an answer.
-4. **Push and open.** `git push -u origin HEAD`, then `gh pr create -R jcalderonzumba/opencode-cursor-v2 --base main --head <branch> --title "<plain words>" --body-file <top>/.superpowers/review/<branch-dir>/pr-body.md`. A refusal is a stop for the owner.
-5. **Verify the head.** `gh pr view <n> -R jcalderonzumba/opencode-cursor-v2 --json headRefOid` must equal the reviewed sha; otherwise stop and tell the owner.
-6. **The DONE marker, last.** For a plan phase only (not `--no-phase`), append ` — ✅ DONE (PR #<n>)` to the phase's `## Phase <n>` heading in the plan. A step that failed before the PR opened leaves no marker.
+1. **The state held.** `git rev-parse HEAD` equals the brief's head and `git status --porcelain` prints nothing. Otherwise the approval is void: put the state back, or have `phase-builder` commit the change through [the loop](#4-the-loop) and run the next round.
+2. **The public-repo check, again on this head.** `git log --name-only --format= origin/main..HEAD` lists no path under `.superpowers/` or `docs/superpowers/`. Fix commits of later rounds are in this range too. A hit is a stop for the owner, and nothing is pushed.
+3. **Fill the PR draft's Code-review verdict:** the verdict, the reviewed head sha, the round count, the reviewer model and the report file name. Fill Verification with the checks of `checks.txt`.
+4. **Ask once.** Show the owner the branch, the sha and the PR body, and ask with the `question` tool: push the branch and open the PR as shown? A cancelled, unanswered or errored `question` is a stop. Nothing is pushed before an answer.
+5. **Push and open.** `git push -u origin HEAD`, then `gh pr create -R jcalderonzumba/opencode-cursor-v2 --base main --head <branch> --title "<plain words>" --body-file <top>/.superpowers/review/<branch-dir>/pr-body.md`. A refusal is a stop for the owner.
+6. **Verify the head.** `gh pr view <n> -R jcalderonzumba/opencode-cursor-v2 --json headRefOid` must equal the reviewed sha; otherwise stop and tell the owner.
+7. **The DONE marker, last.** For a plan phase only (not `--no-phase`), append ` — ✅ DONE (PR #<n>)` to the phase's `## Phase <n>` heading in the plan. A step that failed before the PR opened leaves no marker.
 
 ## 7 Landing
 
