@@ -54,12 +54,14 @@ The owner may name another model per run with `--model <m>` on `/review-plan` an
 
 ## Commits
 
-Builder commits end with two trailers, passed with several `-m` flags:
+Builder commits are `git commit -m "<subject>" -m "<body>" -m "<trailers>"`. The last `-m` argument holds both trailers on separate lines, with a real line break inside the quotes, so git reads them as one trailer block (two separate `-m` trailers are not both parsed):
 
 ```text
 Co-Authored-By: <exact model name> <noreply@anthropic.com>
-OpenCode-Session: <id>
+Agent-Session: <id>
 ```
+
+The session key carries no product name because agent prompts may rewrite product names.
 
 Read the id with `printenv OPENCODE_SESSION_ID`, as a call of its own. An empty id, or one equal to the dispatcher's session id, is NEEDS_CONTEXT, never guessed.
 
@@ -105,4 +107,5 @@ There is no todo tool; progress lives in the plan file and the SDD ledger.
 ## Documentation and facts
 
 - Outside facts take a primary source: a claim about the OpenCode V2 plugin API, the OpenCode host, or Cursor's protocol cites package types under `node_modules/@opencode/*`, the V2 docs at `opencode.ai/v2/docs`, or a captured request. State the verified host version; list what is unverified.
+- The project contract (five checks) lives in `.opencode/skills/review-plan/contract.md`; `plan-reviewer` and `phase-reviewer` both apply it.
 - README describes the system, not how it was built.

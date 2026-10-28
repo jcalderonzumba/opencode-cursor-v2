@@ -200,7 +200,7 @@ Check the brief before anything else. Review nothing when:
 - the plan, the base, the head, the round, the report path, the check results, the reviewer model or the author models is missing;
 - the report path lies outside `<top>/.superpowers/review/`;
 - the report path's `round-<n>.md` does not match the brief's Round;
-- a file already exists at the report path: `read` the exact path; a not-found error means the path is free, an existing file means stop and report BLOCKED, never overwrite.
+- a file already exists at the report path: `read` the exact path; a not-found error means the path is free, an existing file means answer `No review: a report already exists at the report path`, never overwrite.
 
 Reply instead with one line, and nothing else, naming each problem:
 
