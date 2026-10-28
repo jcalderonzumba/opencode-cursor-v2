@@ -14,10 +14,13 @@ MARKER="SECRET-BODY-MARKER-7f3a"
 
 # Stubs first on PATH. Both log their calls to $STUB_LOG; their behaviour comes from env vars.
 mkdir "$TMP/bin"
-cat >"$TMP/bin/npm" <<'EOF'
+cat >"$TMP/bin/bun" <<'EOF'
 #!/usr/bin/env bash
-echo "npm $*" >>"$STUB_LOG"
-exit "${STUB_NPM_RC:-0}"
+echo "bun $*" >>"$STUB_LOG"
+if [ "$1" = "run" ]; then
+  exit "${STUB_BUN_RC:-0}"
+fi
+exit 0
 EOF
 cat >"$TMP/bin/opencode" <<'EOF'
 #!/usr/bin/env bash
@@ -32,7 +35,7 @@ case "${STUB_OC_MODE:-ok}" in
     ;;
 esac
 EOF
-chmod +x "$TMP/bin/npm" "$TMP/bin/opencode"
+chmod +x "$TMP/bin/bun" "$TMP/bin/opencode"
 
 N=0
 OUT="" ERR="" RC=0
@@ -52,7 +55,7 @@ new_repo() {
   export STUB_LOG="$TMP/log$N"
   : >"$STUB_LOG"
   export STUB_MARKER="$MARKER"
-  unset STUB_NPM_RC STUB_OC_MODE
+  unset STUB_BUN_RC STUB_OC_MODE
 }
 
 # run: runs the script from $W with the stubs first on PATH; sets OUT, ERR, RC.
@@ -81,14 +84,16 @@ run
 has "$OUT" "ok: cursor integration loaded" || fail "success prints the load action: no ok line"
 has "$OUT" "$RESTART" || fail "success prints the load action: no restart line"
 has "$OUT" "/reload" && fail "success prints the load action: mentions /reload"
-called npm || fail "success prints the load action: npm not called"
+expected=$(printf '%s\n' "bun install --frozen-lockfile" "bun run build")
+actual=$(grep '^bun ' "$STUB_LOG" || true)
+[ "$actual" = "$expected" ] || fail "success installs from the lockfile then builds: [$actual]"
 echo "ok success prints the load action"
 
 new_repo
-export STUB_NPM_RC=1
+export STUB_BUN_RC=1
 run
 [ "$RC" -ne 0 ] || fail "build failure stops before the host call: exit 0"
-called npm || fail "build failure stops before the host call: npm not called (anchor)"
+called bun || fail "build failure stops before the host call: bun not called (anchor)"
 called opencode && fail "build failure stops before the host call: opencode was called"
 echo "ok build failure stops before the host call"
 
@@ -129,7 +134,7 @@ new_repo branch
 run
 [ "$RC" -eq 2 ] || fail "on a feature branch is refused: exit $RC"
 has "$ERR" "load-local: HEAD is feat/x, not main" || fail "on a feature branch is refused: no refusal line"
-called npm && fail "on a feature branch is refused: npm was called"
+called bun && fail "on a feature branch is refused: bun was called"
 called opencode && fail "on a feature branch is refused: opencode was called"
 echo "ok on a feature branch is refused"
 
@@ -137,5 +142,12 @@ new_repo detach
 run
 [ "$RC" -eq 2 ] || fail "detached HEAD is refused: exit $RC"
 has "$ERR" "load-local: HEAD is detached, not main" || fail "detached HEAD is refused: no refusal line"
-called npm && fail "detached HEAD is refused: npm was called"
+called bun && fail "detached HEAD is refused: bun was called"
 echo "ok detached HEAD is refused"
+
+INSTALL='bun install --frozen-lockfile'
+bad=$(grep -nE '^(npm|yarn|pnpm) install|^bun install$' "$ROOT/README.md" || true)
+[ -z "$bad" ] || fail "readme install follows the lockfile: $bad"
+grep -qF "$INSTALL" "$ROOT/README.md" || fail "readme install follows the lockfile: missing $INSTALL"
+grep -qF "$INSTALL" "$SCRIPT" || fail "load-local agrees with the readme install: missing $INSTALL"
+echo "ok readme and load-local install from the lockfile"
