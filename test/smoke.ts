@@ -12,11 +12,17 @@ import {
   BidiRequestIdSchema,
   ClientHeartbeatSchema,
   ExecServerMessageSchema,
+  type ExecServerMessage,
   GetUsableModelsResponseSchema,
   InteractionUpdateSchema,
   McpArgsSchema,
+  McpToolDefinitionSchema,
   ModelDetailsSchema,
+  ReadArgsSchema,
+  ShellArgsSchema,
+  WriteArgsSchema,
 } from "../src/proto/agent_pb";
+import { redirectNativeExec } from "../src/native-tools";
 import { Credential, Integration } from "@opencode/plugin";
 import type CursorV2PluginModule from "../src/v2";
 
@@ -892,6 +898,75 @@ async function testCancelPausedBridgeKeepsBridge(
     backend.setHoldRunStream(false);
   }
   console.log("[test] Paused bridge disconnect OK");
+}
+
+async function testPausedBridgeAcceptsCompoundToolCallId(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing resume with a compound tool call id...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamToolCall("call-compound");
+  const controller = new AbortController();
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const first = await readUntilDone(
+      await postChat(port, toolCallMessages("call-compound", false), controller.signal),
+    );
+    assert(first.includes("call-compound"), `Expected the tool call, got: ${first}`);
+
+    // OpenCode sends the call id joined with its own id on the newline.
+    const resumed = await postChat(
+      port,
+      toolCallMessages("call-compound-2\nfc_abc_2", true, "done"),
+      controller.signal,
+    );
+    const body = await withTimeout(resumed.text(), "the compound-id continuation to finish");
+    assert(body.includes("after-tool"), `Expected the continuation on the same stream, got: ${body}`);
+    assertArrayEqual(
+      backend.getMcpResultTexts(),
+      ["done"],
+      "A compound tool call id must reach the paused exec with its result",
+    );
+  } finally {
+    controller.abort();
+    modules.stopProxy();
+    backend.setRunStreamToolCall(undefined);
+    backend.setHoldRunStream(false);
+  }
+  console.log("[test] Compound tool call id OK");
+}
+
+function testNativeToolRedirectsTargetV2Tools() {
+  console.log("[test] Testing native tool redirects target OpenCode V2 names...");
+  const tools = ["read", "write", "shell"].map((name) =>
+    create(McpToolDefinitionSchema, {
+      name,
+      toolName: name,
+      providerIdentifier: "opencode",
+      description: "",
+      inputSchema: new Uint8Array(),
+    }),
+  );
+  const exec = (message: ExecServerMessage["message"]) =>
+    create(ExecServerMessageSchema, { id: 1, execId: "e1", message });
+
+  const read = redirectNativeExec(exec({ case: "readArgs", value: create(ReadArgsSchema, { path: "/tmp/a" }) }), tools);
+  assert(read, "read must redirect when the read tool is available");
+  assertEqual(read.toolName, "read", "read tool name");
+  assertEqual(read.decodedArgs, JSON.stringify({ path: "/tmp/a" }), "read args must use the V2 path key");
+
+  const write = redirectNativeExec(exec({ case: "writeArgs", value: create(WriteArgsSchema, { path: "/tmp/b", fileText: "hi" }) }), tools);
+  assert(write, "write must redirect when the write tool is available");
+  assertEqual(write.decodedArgs, JSON.stringify({ path: "/tmp/b", content: "hi" }), "write args must use path and content");
+
+  const shell = redirectNativeExec(exec({ case: "shellStreamArgs", value: create(ShellArgsSchema, { command: "ls" }) }), tools);
+  assert(shell, "shell must redirect when the shell tool is available");
+  assertEqual(shell.toolName, "shell", "shell tool name");
+  assertEqual(shell.decodedArgs, JSON.stringify({ command: "ls" }), "shell args carry only the command");
+  assertEqual(shell.binding.resultType, "shellStreamResult", "a streamed shell keeps its stream result type");
+  console.log("[test] Native tool redirects OK");
 }
 
 async function testStopProxyClearsPausedBridges(
@@ -1908,6 +1983,8 @@ async function main() {
     await testHttp1NonStreamingSurfacesUpstreamErrors(modules, backend);
     await testHttp1PausedStreamIsCapped(modules, backend);
     await testCancelPausedBridgeKeepsBridge(modules, backend);
+    await testPausedBridgeAcceptsCompoundToolCallId(modules, backend);
+    testNativeToolRedirectsTargetV2Tools();
     await testStopProxyClearsPausedBridges(modules, backend);
     await testAuthParams(modules);
     await testTokenExpiry(modules);

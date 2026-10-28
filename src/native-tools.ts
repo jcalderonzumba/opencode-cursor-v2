@@ -89,7 +89,7 @@ export function redirectNativeExec(
     return {
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,
-      decodedArgs: JSON.stringify({ filePath: args.path ?? "" }),
+      decodedArgs: JSON.stringify({ path: args.path ?? "" }),
       binding: { resultType: "readResult", args: { path: args.path ?? "" } },
     };
   }
@@ -105,7 +105,7 @@ export function redirectNativeExec(
     return {
       toolCallId: args.toolCallId || crypto.randomUUID(),
       toolName,
-      decodedArgs: JSON.stringify({ filePath: args.path ?? "", content }),
+      decodedArgs: JSON.stringify({ path: args.path ?? "", content }),
       binding: {
         resultType: "writeResult",
         args: {
@@ -131,11 +131,10 @@ export function redirectNativeExec(
 
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
-    const toolName = pick(["bash"]);
+    const toolName = pick(["shell", "bash"]);
     if (!toolName) return null;
     const decodedArgs: Record<string, unknown> = {
       command: args.command ?? "",
-      description: "Runs shell command",
     };
     if (args.workingDirectory) decodedArgs.workdir = args.workingDirectory;
     if (args.timeout > 0) decodedArgs.timeout = args.timeout;
@@ -341,7 +340,7 @@ export function sendNativeExecResult(
       sendExec(
         "shellStream",
         create(ShellStreamSchema, {
-          event: { case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) },
+          event: { case: "exit", value: create(ShellStreamExitSchema, { code: Number(args.exitCode ?? 0) }) },
         }),
       );
       const controlMessage = create(ExecClientControlMessageSchema, {
