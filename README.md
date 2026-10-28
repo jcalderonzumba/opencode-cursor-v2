@@ -148,6 +148,8 @@ bun run build
 bun test/smoke.ts
 ```
 
+`@opencode/plugin` is only a devDependency (types and the smoke test): the OpenCode host provides it to plugins at runtime.
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai) V2 (2.1.4 verified)
