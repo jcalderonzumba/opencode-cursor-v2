@@ -24,7 +24,7 @@ Apply every check of `contract.md` (in this skill's directory) with its trigger.
 Check the plan against the code as it is. Use the `codegraph` CLI (`explore`, `callers`, `impact`, `affected`) when `.codegraph/` exists at the repo root, otherwise the `grep` and `read` tools. A symbol the index does not hold is checked by reading the code, and the report says so.
 
 1. **Named things exist as stated.** Every file, symbol, signature and caller the plan names. **Must Fix**: a task built on one that does not exist or differs.
-2. **Callers.** For each existing symbol the plan changes (at most 10, most callers first), list its callers. **Must Fix**: a caller of a changed contract that no task or test covers, including a task that claims a green suite while a caller sits in a file a later task owns.
+2. **Callers.** For each existing symbol the plan changes, most callers first, list its callers. A symbol left unchecked is named in the summary as not checked, with the reason. **Must Fix**: a caller of a changed contract that no task or test covers, including a task that claims a green suite while a caller sits in a file a later task owns.
 3. **Scope.** When the plan states a scope (a file count or a file list), compare it with the files the changes reach. **Must Fix**: reality is more than twice the stated scope. **Should Fix**: 1.5 to 2 times.
 
 Skipped, with the reason, when the plan only adds files that call nothing existing.
@@ -60,7 +60,7 @@ Finding ids are `R<round>-M<n>` (Must Fix), `R<round>-S<n>` (Should Fix) and `R<
 
 This section is the dispatching session's. The session that wrote the plan never reviews inline and never through another agent type.
 
-**Arguments.** `$ARGUMENTS` is `<plan> [phase numbers] [--model <m>]`. Take the plan path and the phase numbers (none means the whole plan). When the plan or the part is unclear, ask the owner.
+**Arguments.** `$ARGUMENTS` is `<plan> [phase numbers] [--model <m>]`. Take the plan path and the phase numbers (none means the whole plan). `--model` given more than once or without a value, or any other token, is a stop with one line naming it. When the plan or the part is unclear, ask the owner.
 
 **The model.** `--model <m>` is accepted only when `<m>` is in the reviewer list of `AGENTS.md` ("Roles and models") and matches `^[a-z0-9-]+/[A-Za-z0-9._-]+(#[A-Za-z0-9._-]+)?$`. Otherwise stop with one line naming the value, before creating any directory or dispatching. With no `--model`, the dispatch passes no model and the agent file's model applies. The author model is this session's own model as `provider/model`, or `unknown`.
 
@@ -74,7 +74,7 @@ This section is the dispatching session's. The session that wrote the plan never
 - **Plan:** the plan path, and the whole plan or the `## Phase N` sections.
 - **Round:** `<n>`.
 - **Report:** `<top>/.superpowers/review-plan/<review id>/round-<n>.md`.
-- **Reviewer model:** the model, then `default` or `owner override`. For `default`, the `model` of `.opencode/agents/plan-reviewer.md`. From round 2, repeat the previous report's header.
+- **Reviewer model:** the model, then `default` or `owner override`. For `default`, the `model` of `.opencode/agents/plan-reviewer.md`. Each round's brief names the model that round's dispatch uses.
 - **Author model:** as above.
 - **Previous report:** the path of round `<n-1>` (round 2 and later).
 - **What changed:** one line per previous finding, `<id>: <what the author changed>`: fixed, deferred with the reason the plan states, or ruled on by the owner (round 2 and later).
@@ -85,6 +85,7 @@ This section is the dispatching session's. The session that wrote the plan never
 **Its answer.** The final message is the verdict line, then the report path. Read the report there.
 - `No review: …`: the brief lacked a field or the report path is unusable. Fix the brief and dispatch the same round again. If the reason is that a file already exists at the report path, the round is finished: read that report and do not dispatch again.
 - A second line `report not written: …`: the round left no record, so its verdict counts for nothing. Have the owner resolve the refusal, then dispatch the same round again.
+- Any other answer (BLOCKED included): the round gave no verdict. Stop and tell the owner.
 
 ## Rounds
 
