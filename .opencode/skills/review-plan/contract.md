@@ -39,7 +39,6 @@ The HTTP/2 path is the default. Code shared by both transports (request building
 **Severities:**
 - **Must Fix:** a change to shared code that the default path runs, with no test that decodes a real request or response.
 - **Should Fix:** the change is not called out in the plan or the PR text.
-- **Consider:** a shared helper that the default path could stop depending on.
 
 ## Check 4: Outside facts
 
@@ -48,7 +47,8 @@ The HTTP/2 path is the default. Code shared by both transports (request building
 Each such claim rests on a primary source the plan or PR text cites: package types under `node_modules/@opencode/*`, the V2 docs at `opencode.ai/v2/docs`, or a captured request. The verified host version is stated (OpenCode 2.1.4 at the time of writing), and surfaces not verified are listed as unverified. The reviewers never research; the revision does.
 
 **Severities:**
-- **Must Fix:** a decision rests on an unbacked claim, with no step that verifies it live before the work that depends on it.
+- **Must Fix:** in a plan, a decision rests on an unbacked claim, with no step that verifies it live before the work that depends on it.
+- **Must Fix:** in a diff, a claim the change depends on with no live verification recorded in the PR draft's Verification section.
 - **Should Fix:** the host version is not stated, or unverified surfaces are not listed.
 - **Consider:** an unbacked claim that appears only in a comment or README line.
 

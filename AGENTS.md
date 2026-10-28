@@ -58,8 +58,10 @@ Builder commits are `git commit -m "<subject>" -m "<body>" -m "<trailers>"`. The
 
 ```text
 Co-Authored-By: <exact model name> <noreply@anthropic.com>
-OpenCode-Session: <id>
+Agent-Session: <id>
 ```
+
+The session key carries no product name because agent prompts may rewrite product names.
 
 Read the id with `printenv OPENCODE_SESSION_ID`, as a call of its own. An empty id, or one equal to the dispatcher's session id, is NEEDS_CONTEXT, never guessed.
 

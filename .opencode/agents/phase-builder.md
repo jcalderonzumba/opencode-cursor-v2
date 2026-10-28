@@ -285,8 +285,9 @@ A brief missing the task, the constraints, the branch or the dispatcher's sessio
 5. **Commit** with literal arguments:
    - Read your session id with `printenv OPENCODE_SESSION_ID`, as a call of its own. An empty id, or one equal to the dispatcher's, is a NEEDS_CONTEXT report, never a guess; leave the work uncommitted.
    - Stage explicit paths with `git add <path> ...`; the paths exclude `.superpowers/` and `docs/superpowers/`.
-   - Run `git commit -m "<subject>" -m "<body>" -m "<trailers>"`. The subject is a short imperative line, the body one to three lines, the third `-m` argument holds both trailers, one per line, with a real newline between them inside the quotes (never two `-m` arguments, git would read only the last as a trailer): `Co-Authored-By: <model name> <noreply@anthropic.com>` and `OpenCode-Session: <id>`. The text is literal, with no `$(…)`, no heredoc and none of the characters shell refuses.
+   - Run `git commit -m "<subject>" -m "<body>" -m "<trailers>"`. The subject is a short imperative line, the body one to three lines, the third `-m` argument holds both trailers, one per line, with a real newline between them inside the quotes (never a separate `-m` per trailer: git would read only the last as a trailer): `Co-Authored-By: <model name> <noreply@anthropic.com>` and `Agent-Session: <id>`. The text is literal, with no `$(…)`, no heredoc and none of the characters shell refuses.
    - Confirm with `git rev-parse HEAD` and `git status --short`.
+   - Check the trailers with `git log -1 "--format=%(trailers:only)"`, as a call of its own. Both a `Co-Authored-By: …` line and an `Agent-Session: …` line must be listed. If either is missing, amend once with `git commit --amend -m "<subject>" -m "<body>" -m "<trailers>"` (same form, both trailers in the last `-m` on separate lines) and run the check again. If it still fails, report NEEDS_CONTEXT. The report names the check's output.
 
 ## The report and your final message
 

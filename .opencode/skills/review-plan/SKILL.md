@@ -65,9 +65,9 @@ This section is the dispatching session's. The session that wrote the plan never
 **The model.** `--model <m>` is accepted only when `<m>` is in the reviewer list of `AGENTS.md` ("Roles and models") and matches `^[a-z0-9-]+/[A-Za-z0-9._-]+(#[A-Za-z0-9._-]+)?$`. Otherwise stop with one line naming the value, before creating any directory or dispatching. With no `--model`, the dispatch passes no model and the agent file's model applies. The author model is this session's own model as `provider/model`, or `unknown`.
 
 **The review.**
-- The review id is the plan's basename without `.md`, then `-`, then the phase numbers joined by `+`, or `all`: Phases 3 and 4 of `2026-10-28-workflow.md` are `2026-10-28-workflow-3+4`.
+- The review id is the plan's basename without `.md`, then `-`, then the phase numbers in ascending order joined by `+`, or `all`: Phases 3 and 4 of `2026-10-28-workflow.md` are `2026-10-28-workflow-3+4`.
 - The directory is `.superpowers/review-plan/<review id>/` (git-ignored). The report is `round-<n>.md` there and the owner's rulings are `rulings.md` there. Only you write `rulings.md`; `plan-reviewer` writes only its `round-<n>.md`.
-- The round is the next number not yet present. List the directory with the `glob` tool, `path` set to the directory (a pattern from the project root cannot see git-ignored paths), or read the exact path. No directory yet means round 1.
+- The round is the next number not yet present. List the directory with the `glob` tool, `path` set to the directory (a pattern from the project root cannot see git-ignored paths), or read the exact path. No directory yet means round 1. Round 4 or later needs an `After round <n> (owner's decision)` line in `rulings.md` recording the owner's decision; without it, stop and tell the owner.
 
 **The brief.** Send these fields, with paths as `plan-reviewer` can resolve them (in full, from `git rev-parse --show-toplevel`):
 
@@ -89,7 +89,7 @@ This section is the dispatching session's. The session that wrote the plan never
 
 ## Rounds
 
-- **Not approved:** revise the plan for every Must Fix; fix each Should Fix or defer it in the plan with a stated reason; a Consider is optional. Then dispatch the next round with a fresh brief.
+- **Not approved:** revise the plan for every Must Fix; fix each Should Fix or defer it in the plan with a stated reason; a Consider is optional. Then dispatch the next round with a fresh brief (round 1 or 2 only; see the cap below).
 - **At most 3 rounds.** After round 3, or any later round, with Must Fix findings open, the open findings go to the owner, who decides: another round, or how they are settled. Append the decision to `rulings.md` as `- After round <n> (owner's decision): <decision> (<YYYY-MM-DD>)`. It binds later rounds.
 - **Approved:** the part may be built. Its Should Fix items are still fixed or deferred in the plan with a stated reason.
 
