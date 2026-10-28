@@ -1,5 +1,5 @@
 import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import http from "node:http";
 import http2 from "node:http2";
@@ -506,7 +506,7 @@ async function testProxyStartStop(modules: TestModules) {
     throw new Error("getProxyPort() mismatch");
   }
 
-  const modelsRes = await fetch(`http://localhost:${port}/v1/models`);
+  const modelsRes = await fetch(`http://127.0.0.1:${port}/v1/models`);
   if (!modelsRes.ok) {
     throw new Error(`/v1/models returned ${modelsRes.status}`);
   }
@@ -519,7 +519,7 @@ async function testProxyStartStop(modules: TestModules) {
   }
   console.log("[test] /v1/models OK");
 
-  const badRes = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+  const badRes = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: "test", messages: [] }),
@@ -533,7 +533,7 @@ async function testProxyStartStop(modules: TestModules) {
   }
   console.log("[test] Missing user message validation OK");
 
-  const notFoundRes = await fetch(`http://localhost:${port}/unknown`);
+  const notFoundRes = await fetch(`http://127.0.0.1:${port}/unknown`);
   if (notFoundRes.status !== 404) {
     throw new Error(`Expected 404, got ${notFoundRes.status}`);
   }
@@ -544,6 +544,32 @@ async function testProxyStartStop(modules: TestModules) {
     throw new Error("Proxy port should be undefined after stop");
   }
   console.log("[test] Proxy stop OK");
+}
+
+/** The proxy spends the user's Cursor account, so only this machine may reach it. */
+async function testProxyBindsLoopbackOnly(modules: TestModules) {
+  console.log("[test] Testing the proxy is reachable on loopback only...");
+  const port = await modules.startProxy(async () => "test-token");
+  try {
+    const loopback = await fetch(`http://127.0.0.1:${port}/v1/models`);
+    assertEqual(loopback.status, 200, "Expected /v1/models on 127.0.0.1");
+
+    const lan = Object.values(networkInterfaces())
+      .flat()
+      .find((iface) => iface && iface.family === "IPv4" && !iface.internal);
+    if (!lan) {
+      console.log("[test] No non-internal IPv4 address; skipping the LAN reachability check");
+    } else {
+      let reached: number | undefined;
+      try {
+        reached = (await fetch(`http://${lan.address}:${port}/v1/models`)).status;
+      } catch {}
+      assertEqual(reached, undefined, `Expected no answer on ${lan.address}`);
+    }
+  } finally {
+    modules.stopProxy();
+  }
+  console.log("[test] Loopback-only binding OK");
 }
 
 async function testStreamCancellationStopsBridge(
@@ -559,7 +585,7 @@ async function testStreamCancellationStopsBridge(
     const fetchTimeout = setTimeout(() => controller.abort(), 10_000);
     let res: Response;
     try {
-      res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -686,7 +712,7 @@ async function testHttp1NonStreamingSurfacesUpstreamErrors(
     backend.setHttp1Fault(fault);
     try {
       const port = await modules.startProxy(async () => "test-token", [], true);
-      const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -781,7 +807,7 @@ async function waitFor(condition: () => boolean, message: string) {
 }
 
 function postChat(port: number, messages: unknown[], signal: AbortSignal) {
-  return fetch(`http://localhost:${port}/v1/chat/completions`, {
+  return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: "composer-2", stream: true, messages }),
@@ -1200,7 +1226,7 @@ async function testV2Plugin(
   const providerBaseURL = providerInfo.settings?.baseURL;
   assertEqual(
     providerBaseURL,
-    `http://localhost:${modules.getProxyPort()}/v1`,
+    `http://127.0.0.1:${modules.getProxyPort()}/v1`,
     "Expected V2 provider base URL to point at the local proxy",
   );
   assertArrayEqual(
@@ -1269,7 +1295,7 @@ async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Testing array content (plan-mode) parsing...");
   const port = await modules.startProxy(async () => "test-token");
 
-  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1440,7 +1466,7 @@ async function testDiscoveryFallbackAndSuccess(
   );
 
   const fallbackPort = await modules.startProxy(async () => accessToken, fallbackModels);
-  const fallbackRes = await fetch(`http://localhost:${fallbackPort}/v1/models`);
+  const fallbackRes = await fetch(`http://127.0.0.1:${fallbackPort}/v1/models`);
   assertEqual(fallbackRes.status, 200, "Expected degraded /v1/models to succeed");
   const fallbackBody = await fallbackRes.json();
   assertEqual(
@@ -1465,7 +1491,7 @@ async function testDiscoveryFallbackAndSuccess(
   );
 
   const discoveredPort = await modules.startProxy(async () => accessToken, discovered);
-  const discoveredRes = await fetch(`http://localhost:${discoveredPort}/v1/models`);
+  const discoveredRes = await fetch(`http://127.0.0.1:${discoveredPort}/v1/models`);
   assertEqual(discoveredRes.status, 200, "Expected discovered /v1/models to succeed");
   const discoveredBody = await discoveredRes.json();
   assertArrayEqual(
@@ -1802,6 +1828,7 @@ async function main() {
     await testBridgeFraming();
     await testHttp1WireFormat();
     await testProxyStartStop(modules);
+    await testProxyBindsLoopbackOnly(modules);
     await testStreamingFrameParser();
     await testStreamCancellationStopsBridge(modules, backend);
     await testBridgeResolvesUnderOddInstallPath(backend);

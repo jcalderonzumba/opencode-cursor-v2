@@ -95,7 +95,7 @@ const CursorV2Plugin = Plugin.define({
       info.activation = "auto";
       info.package = OPENAI_COMPATIBLE_PACKAGE;
       info.settings = {
-        baseURL: `http://localhost:${current.port}/v1`,
+        baseURL: `http://127.0.0.1:${current.port}/v1`,
       };
 
       const models = current.models.map((cursorModel) => {

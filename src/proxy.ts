@@ -645,6 +645,7 @@ export async function startProxy(
   pruneStaleConversationFiles();
 
   proxyServer = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     idleTimeout: 255,
     async fetch(req) {
