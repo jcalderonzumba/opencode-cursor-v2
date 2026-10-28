@@ -77,7 +77,7 @@ model='[A-Za-z0-9][A-Za-z0-9._/#-]*'
 [[ -n $checks ]] || die 'a brief needs --checks <file>'
 [[ $reviewer =~ ^$model$ ]] || die "the reviewer is not a valid model: $reviewer"
 [[ $author =~ ^$model(,$model)*$ ]] || die "the author is not a valid model (list): $author"
-[[ -s $checks ]] || die "the --checks file is missing or empty: $checks"
+[[ -f $checks && -s $checks ]] || die "the --checks file is missing, empty or not a file: $checks"
 
 top=$(git rev-parse --show-toplevel) || die 'not inside a git repository'
 branch=$(git symbolic-ref --short -q HEAD) || die 'HEAD is detached'
@@ -140,6 +140,8 @@ printf -- '- **Round:** %s\n' "$round"
 printf -- '- **Report:** `%s/round-%s.md`\n' "$review" "$round"
 printf -- '- **Check results:**\n%s\n' "$fence"
 cat "$checks"
+# A last line without a newline would swallow the closing fence.
+[[ -z $(tail -c1 "$checks") ]] || echo
 printf '%s\n' "$fence"
 printf -- '- **Reviewer model:** `%s`, %s\n' "$reviewer" "$marker"
 printf -- '- **Author models:** `%s`\n' "$author"

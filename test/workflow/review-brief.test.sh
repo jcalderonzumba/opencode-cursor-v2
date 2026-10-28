@@ -203,6 +203,29 @@ build: ok
 done_case
 
 new_repo
+printf 'x' >"$TMP/nonl.txt"
+passes "checks without a trailing newline keep the fence closed" --no-phase x --reviewer "$REVIEWER" --author "$AUTHOR" --checks "$TMP/nonl.txt"
+has "- **Check results:**
+\`\`\`
+x
+\`\`\`
+- **Reviewer model:**"
+done_case
+
+new_repo
+printf '%s\n' '```' >"$TMP/ticks.txt"
+passes "a fence in the checks lengthens the block fence" --no-phase x --reviewer "$REVIEWER" --author "$AUTHOR" --checks "$TMP/ticks.txt"
+has "- **Check results:**
+\`\`\`\`
+\`\`\`
+\`\`\`\`
+- **Reviewer model:**"
+done_case
+
+new_repo
+refused "checks that is a directory is refused" "checks" --no-phase x --reviewer "$REVIEWER" --author "$AUTHOR" --checks "$TMP"
+
+new_repo
 git -C "$W" update-ref -d refs/remotes/origin/main
 refused "no origin/main is refused" "origin/main" --no-phase x "${STD[@]}"
 
