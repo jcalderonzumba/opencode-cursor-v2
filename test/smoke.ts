@@ -59,7 +59,7 @@ interface TestCursorBackend {
   setHoldRunStream: (hold: boolean) => void;
   /** While holding, also emit an MCP tool call with this id; the stream answers the tool result and ends. */
   setRunStreamToolCall: (toolCallId: string | undefined) => void;
-  /** While holding, also emit this native exec request (id 1, exec id `exec-1`). */
+  /** While holding, also emit this native exec request (id 1, exec id `exec-1`). HTTP/2 only: the HTTP/1 held path ignores it. */
   setRunStreamExec: (message: ExecServerMessage["message"] | undefined) => void;
   getOpenRunStreamCount: () => number;
   /** Refuse connections of the other protocol, like a network that blocks HTTP/2. */
@@ -928,18 +928,18 @@ async function testPausedBridgeAcceptsCompoundToolCallId(
   try {
     const port = await modules.startProxy(async () => "test-token");
     const first = await withTimeout(
-      readUntilDone(await postChat(port, toolCallMessages("call-compound", false), controller.signal)),
+      postChat(port, toolCallMessages("call-compound", false), controller.signal).then(readUntilDone),
       "the compound-id tool call to reach the stream",
     );
     assert(first.includes("call-compound"), `Expected the tool call, got: ${first}`);
 
     // OpenCode sends the call id joined with its own id on the newline.
-    const resumed = await postChat(
-      port,
-      toolCallMessages("call-compound-2\nfc_abc_2", true, "done"),
-      controller.signal,
+    const body = await withTimeout(
+      postChat(port, toolCallMessages("call-compound-2\nfc_abc_2", true, "done"), controller.signal).then((res) =>
+        res.text(),
+      ),
+      "the compound-id continuation to finish",
     );
-    const body = await withTimeout(resumed.text(), "the compound-id continuation to finish");
     assert(body.includes("after-tool"), `Expected the continuation on the same stream, got: ${body}`);
     assertArrayEqual(
       backend.getMcpResultTexts(),
@@ -1006,16 +1006,28 @@ const protoMessage = (no: number, ...fields: Uint8Array[]) => {
   const body = protoBytes(...fields);
   return protoBytes(Uint8Array.of((no << 3) | 2, body.length), body);
 };
+const protoVarint = (value: number) => {
+  const bytes: number[] = [];
+  for (; value > 0x7f; value >>= 7) bytes.push((value & 0x7f) | 0x80);
+  return Uint8Array.of(...bytes, value);
+};
 
 async function testUnknownExecFieldsRedirectToV2Tools() {
   console.log("[test] Testing unknown exec fields redirect to OpenCode V2 tools...");
   const { answerUnknownExec } = await import("../src/proxy");
   const v2Tools = testTools("read", "shell", "edit", "write");
-  const cases: Array<{ no: number; fields: Uint8Array[]; tools?: typeof v2Tools; expected: string }> = [
+  const cases: Array<{
+    no: number;
+    fields: Uint8Array[];
+    tools?: typeof v2Tools;
+    expected: string;
+    toolCallId?: string;
+  }> = [
     {
       no: 29,
       fields: [toBinary(ReadArgsSchema, create(ReadArgsSchema, { path: "/tmp/a", toolCallId: "tc-29" }))],
       expected: `read ${JSON.stringify({ path: "/tmp/a" })}`,
+      toolCallId: "tc-29",
     },
     {
       no: 45,
@@ -1038,17 +1050,27 @@ async function testUnknownExecFieldsRedirectToV2Tools() {
   ];
 
   const mismatches: string[] = [];
-  for (const { no, fields, tools, expected } of cases) {
+  for (const { no, fields, tools, expected, toolCallId } of cases) {
     const payload = protoBytes(...fields);
-    const exec = create(ExecServerMessageSchema, { id: 1, execId: "e1" });
-    exec.$unknown = [{ no, wireType: 2, data: protoBytes(Uint8Array.of(payload.length), payload) }];
-    const redirects: Array<{ toolName: string; decodedArgs: string }> = [];
+    // Real wire bytes: the known fields plus one length-delimited unknown field, decoded by protobuf-es.
+    const wire = protoBytes(
+      toBinary(ExecServerMessageSchema, create(ExecServerMessageSchema, { id: 1, execId: "e1" })),
+      protoVarint((no << 3) | 2),
+      protoVarint(payload.length),
+      payload,
+    );
+    const exec = fromBinary(ExecServerMessageSchema, wire);
+    assertEqual(exec.$unknown?.length, 1, `field ${no} must decode as one unknown field`);
+    const redirects: Array<{ toolName: string; decodedArgs: string; toolCallId: string }> = [];
     let frames = 0;
     answerUnknownExec(exec, tools ?? v2Tools, () => { frames += 1; }, (redirect) => redirects.push(redirect));
     const actual = redirects.length === 1 && frames === 0
       ? `${redirects[0]!.toolName} ${redirects[0]!.decodedArgs}`
       : `${redirects.length} redirects, ${frames} frames`;
     if (actual !== expected) mismatches.push(`field ${no}: expected ${expected}, got ${actual}`);
+    if (toolCallId && redirects[0]?.toolCallId !== toolCallId) {
+      mismatches.push(`field ${no}: expected toolCallId ${toolCallId}, got ${redirects[0]?.toolCallId}`);
+    }
   }
   assertArrayEqual(mismatches, [], "Unknown exec fields must hand V2 tool names and arguments to the host");
   console.log("[test] Unknown exec field redirects OK");
@@ -1066,7 +1088,10 @@ async function testRejectedShellStreamAnswersWithStreamFrames(
   try {
     // No tools in the request: the proxy has nothing to redirect the shell to.
     const port = await modules.startProxy(async () => "test-token");
-    await postChat(port, [{ role: "user", content: "run ls" }], controller.signal);
+    await withTimeout(
+      postChat(port, [{ role: "user", content: "run ls" }], controller.signal),
+      "the rejected-shell stream to start",
+    );
     await waitFor(
       () => backend.getExecReplies().some((reply) =>
         reply.case === "execClientControlMessage"
@@ -2129,6 +2154,16 @@ async function testHttpTransportFromEnv() {
   console.log("[test] CURSOR_DISABLE_HTTP2=1 OK");
 }
 
+// SMOKE_ONLY=a,b runs only the tests whose function name contains one of the
+// comma-separated parts, case-insensitively (e.g. SMOKE_ONLY=RejectedShell).
+const smokeOnly = (process.env.SMOKE_ONLY ?? "").toLowerCase().split(",").map((part) => part.trim()).filter(Boolean);
+let smokeRan = 0;
+async function run<A extends unknown[]>(test: (...args: A) => unknown, ...args: A): Promise<void> {
+  if (smokeOnly.length && !smokeOnly.some((part) => test.name.toLowerCase().includes(part))) return;
+  smokeRan += 1;
+  await test(...args);
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -2142,33 +2177,34 @@ async function main() {
       process.exitCode = 0;
       return;
     }
-    await testBridgeFraming();
-    await testHttp1WireFormat();
-    await testProxyStartStop(modules);
-    await testProxyBindsLoopbackOnly(modules);
-    await testStreamingFrameParser();
-    await testStreamCancellationStopsBridge(modules, backend);
-    await testBridgeResolvesUnderOddInstallPath(backend);
-    await testHttp1StreamCancellationAndStop(modules, backend);
-    await testHttp1NonStreamingSurfacesUpstreamErrors(modules, backend);
-    await testHttp1PausedStreamIsCapped(modules, backend);
-    await testCancelPausedBridgeKeepsBridge(modules, backend);
-    await testPausedBridgeAcceptsCompoundToolCallId(modules, backend);
-    testNativeToolRedirectsTargetV2Tools();
-    await testUnknownExecFieldsRedirectToV2Tools();
-    await testRejectedShellStreamAnswersWithStreamFrames(modules, backend);
-    await testCheckpointFallbackSettlesCompoundToolCallIds();
-    await testStopProxyClearsPausedBridges(modules, backend);
-    await testAuthParams(modules);
-    await testTokenExpiry(modules);
-    await testArrayContentParsing(modules);
-    await testRunActionAfterToolHistory(modules, backend);
-    await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
-    await testDiscoveryFallbackAndSuccess(modules, backend);
-    await testV2Plugin(modules, backend);
-    await testHttpTransportSelection(modules, backend, false);
-    await testHttpTransportFromEnv();
-    console.log("\n✓ All smoke tests passed");
+    await run(testBridgeFraming);
+    await run(testHttp1WireFormat);
+    await run(testProxyStartStop, modules);
+    await run(testProxyBindsLoopbackOnly, modules);
+    await run(testStreamingFrameParser);
+    await run(testStreamCancellationStopsBridge, modules, backend);
+    await run(testBridgeResolvesUnderOddInstallPath, backend);
+    await run(testHttp1StreamCancellationAndStop, modules, backend);
+    await run(testHttp1NonStreamingSurfacesUpstreamErrors, modules, backend);
+    await run(testHttp1PausedStreamIsCapped, modules, backend);
+    await run(testCancelPausedBridgeKeepsBridge, modules, backend);
+    await run(testPausedBridgeAcceptsCompoundToolCallId, modules, backend);
+    await run(testNativeToolRedirectsTargetV2Tools);
+    await run(testUnknownExecFieldsRedirectToV2Tools);
+    await run(testRejectedShellStreamAnswersWithStreamFrames, modules, backend);
+    await run(testCheckpointFallbackSettlesCompoundToolCallIds);
+    await run(testStopProxyClearsPausedBridges, modules, backend);
+    await run(testAuthParams, modules);
+    await run(testTokenExpiry, modules);
+    await run(testArrayContentParsing, modules);
+    await run(testRunActionAfterToolHistory, modules, backend);
+    await run(testExpiredTokenRefreshBeforeDiscovery, modules, backend);
+    await run(testDiscoveryFallbackAndSuccess, modules, backend);
+    await run(testV2Plugin, modules, backend);
+    await run(testHttpTransportSelection, modules, backend, false);
+    await run(testHttpTransportFromEnv);
+    if (smokeOnly.length && smokeRan === 0) throw new Error(`SMOKE_ONLY=${process.env.SMOKE_ONLY} matched no test`);
+    console.log(smokeOnly.length ? `\n✓ ${smokeRan} selected smoke test(s) passed` : "\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
     console.error("\n✗ Smoke test failed:", err);
