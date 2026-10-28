@@ -107,7 +107,7 @@ bash <top>/scripts/review-brief.sh --no-phase "<purpose>" --reviewer <model> --a
 
 Round 4 or later needs an `After round <n> (owner's decision)` line in `rulings.md` recording the owner's decision; without it, stop and tell the owner, and generate no brief.
 
-The PR draft's Summary states the base and how it was chosen. A `--no-phase` audit of commits already on `main` names its range there.
+The PR draft's Summary states the brief's Base, the merge base the brief names; a range other than it is not reviewable through this skill. A `--no-phase` audit of commits already on `main` names the brief's Base there and says why the range is empty (the merge base equals HEAD).
 
 ## 3 Dispatch
 
