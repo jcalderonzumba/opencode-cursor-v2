@@ -1,5 +1,5 @@
 ---
-description: Review the current branch's diff with phase-reviewer before its pull request opens, then open the PR on approval. Usage /review-phase [--model <m>] [--no-phase "<purpose>"]. Only the owner starts it.
+description: Review the current branch's diff with phase-reviewer before its pull request opens, then open the PR on the owner's word. Usage /review-phase [--model <m>] [--no-phase "<purpose>"]. Only the owner starts it.
 subagent: false
 ---
 
