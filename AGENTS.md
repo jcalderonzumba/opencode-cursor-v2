@@ -105,4 +105,5 @@ There is no todo tool; progress lives in the plan file and the SDD ledger.
 ## Documentation and facts
 
 - Outside facts take a primary source: a claim about the OpenCode V2 plugin API, the OpenCode host, or Cursor's protocol cites package types under `node_modules/@opencode/*`, the V2 docs at `opencode.ai/v2/docs`, or a captured request. State the verified host version; list what is unverified.
+- The project contract (five checks) lives in `.opencode/skills/review-plan/contract.md`; `plan-reviewer` and `phase-reviewer` both apply it.
 - README describes the system, not how it was built.
