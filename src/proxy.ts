@@ -345,6 +345,61 @@ export function setHttp1PausedStreamMaxMsForTesting(ms = HTTP1_PAUSED_STREAM_MAX
   http1PausedStreamMaxMs = ms;
 }
 
+// An active turn with no decoded progress for this long is stalled. Client and
+// server heartbeats do not count, and a pause for a tool result is exempt.
+const STREAM_STALL_MAX_MS = 120_000;
+let streamStallMaxMs = STREAM_STALL_MAX_MS;
+
+/** Test hook: shorten the active-stream stall limit. Call without an argument to restore it. */
+export function setStreamStallMaxMsForTesting(ms = STREAM_STALL_MAX_MS): void {
+  streamStallMaxMs = ms;
+}
+
+/**
+ * Decides stall liveness: a decoded server message counts only when it carries
+ * turn content. A bare heartbeat (or an empty message) proves the socket is
+ * open, not that the turn advances, so it must not reset the clock.
+ */
+function isTurnProgress(msg: AgentServerMessage): boolean {
+  const msgCase = msg.message.case;
+  if (msgCase === undefined) return false;
+  if (msgCase === "interactionUpdate") {
+    const updateCase = msg.message.value.message?.case;
+    return updateCase !== undefined && updateCase !== "heartbeat";
+  }
+  return true;
+}
+
+/** Idle timer reset by `touch` on turn progress; `stop` clears it on teardown. */
+function createStreamStallWatch(onStall: () => void): { touch: () => void; stop: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  return {
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
+    },
+    touch() {
+      clearTimeout(timer);
+      if (stopped) return;
+      timer = setTimeout(onStall, streamStallMaxMs);
+      timer.unref?.();
+    },
+  };
+}
+
+function reportStalledStream(
+  sendSSE: (data: object) => void,
+  makeChunk: (delta: Record<string, unknown>, finishReason?: string | null) => object,
+  makeUsageChunk: () => object,
+  sendDone: () => void,
+): void {
+  sendSSE(makeChunk({ content: "\n[Error: Cursor stream stalled]" }));
+  sendSSE(makeChunk({}, "stop"));
+  sendSSE(makeUsageChunk());
+  sendDone();
+}
+
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 // Conversation state also persists to disk so context survives proxy/opencode
@@ -1789,6 +1844,7 @@ async function handleHttp1StreamingResponse(
       let pausedTimer: ReturnType<typeof setTimeout> | undefined;
       const teardown = () => {
         clearTimeout(pausedTimer);
+        stall.stop();
         http1.stop();
         abort.abort();
         activeHttp1Streams.delete(teardown);
@@ -1799,10 +1855,18 @@ async function handleHttp1StreamingResponse(
         closed = true;
         teardown();
       };
+      const stall = createStreamStallWatch(() => {
+        // mcpExecReceived: silence while OpenCode runs a tool is not a stall.
+        if (closed || mcpExecReceived) return;
+        reportStalledStream(sendSSE, makeChunk, makeUsageChunk, sendDone);
+        closeController();
+        teardown();
+      });
 
       const processChunk = (messageBytes: Uint8Array) => {
         try {
           const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+          if (isTurnProgress(serverMessage)) stall.touch();
           processServerMessage(serverMessage, payload.blobStore, payload.mcpTools, payload.cloudRule,
             sendFrame, state,
             (text, isThinking) => {
@@ -1855,6 +1919,7 @@ async function handleHttp1StreamingResponse(
             handleEndStream,
           );
 
+          stall.touch();
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -1915,6 +1980,7 @@ function createBridgeStreamResponse(
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       };
       const stopBridge = () => {
+        stall.stop();
         if (activeBridges.get(bridgeKey)?.bridge === bridge) {
           activeBridges.delete(bridgeKey);
         }
@@ -1963,6 +2029,13 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      const stall = createStreamStallWatch(() => {
+        // mcpExecReceived: silence while OpenCode runs a tool is not a stall.
+        if (closed || mcpExecReceived) return;
+        reportStalledStream(sendSSE, makeChunk, makeUsageChunk, sendDone);
+        closeController();
+        stopBridge();
+      });
 
       const parser = createConnectFrameParser(
         (messageBytes) => {
@@ -1971,6 +2044,7 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
+            if (isTurnProgress(serverMessage)) stall.touch();
             processServerMessage(
               serverMessage,
               blobStore,
@@ -2061,6 +2135,7 @@ function createBridgeStreamResponse(
       bridge.onData((chunk) => parser.push(chunk));
 
       bridge.onClose((code) => {
+        stall.stop();
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -2091,6 +2166,7 @@ function createBridgeStreamResponse(
           }
         }
       });
+      stall.touch();
     },
     cancel() {
       cancelStream?.();
