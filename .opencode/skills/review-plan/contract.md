@@ -9,7 +9,7 @@ Five checks for a public OpenCode V2 plugin that proxies Cursor's agent API. `pl
 
 **Trigger:** every plan and every diff.
 
-The plan or diff matches the approved spec, when one exists, or states its amendment and justifies it. In a diff, an amendment updates the spec's text in the same change.
+The plan or diff matches the approved spec, when one exists, or states its amendment and justifies it. In a diff, the amendment is stated in the PR draft's Deviations section.
 
 **Severities:**
 - **Must Fix:** a deviation from the approved spec that is neither stated nor justified.
@@ -25,8 +25,9 @@ Look for:
 - A read or write of the user's files on Cursor's behalf that bypasses OpenCode's tool path and is not called out.
 
 **Severities:**
-- **Must Fix:** any of the above present and unaddressed.
-- **Should Fix:** a file read or write through OpenCode's tool path that the plan or PR text does not call out.
+- **Must Fix:** any token exposure, a non-loopback bind, a new listener or an unauthenticated endpoint.
+- **Must Fix:** a file read or write that bypasses the tool path and is not called out.
+- **Should Fix:** a bypass of the tool path that is called out but not justified.
 - **Consider:** a log line near a credential path that is safe today but easy to break.
 
 ## Check 3: Default-path stability
@@ -47,7 +48,7 @@ The HTTP/2 path is the default. Code shared by both transports (request building
 Each such claim rests on a primary source the plan or PR text cites: package types under `node_modules/@opencode/*`, the V2 docs at `opencode.ai/v2/docs`, or a captured request. The verified host version is stated (OpenCode 2.1.4 at the time of writing), and surfaces not verified are listed as unverified. The reviewers never research; the revision does.
 
 **Severities:**
-- **Must Fix:** a decision rests on an unbacked claim, or the plan hands the fact to the builder to find out.
+- **Must Fix:** a decision rests on an unbacked claim, with no step that verifies it live before the work that depends on it.
 - **Should Fix:** the host version is not stated, or unverified surfaces are not listed.
 - **Consider:** an unbacked claim that appears only in a comment or README line.
 
@@ -65,11 +66,11 @@ bun test/smoke.ts
 npm run build
 ```
 
-Reviewers run none of them. The controlling session runs them and puts the results in the brief; a result missing from the brief is listed as skipped, with that reason. A plan is checked for the same evidence: each behaviour task states its failing test first, and the three checks gate each commit.
+Reviewers run none of them. In a diff review the controlling session runs them and puts the results in the brief. In a plan review the plan is checked for the same evidence: each behaviour task names the test that fails first, and the three checks gate each commit.
 
 **Severities:**
-- **Must Fix:** new behaviour with no red evidence; a failing check; a test that asserts a mock instead of behaviour; an unbounded wait.
-- **Should Fix:** a test that passes without the change; a check result absent from the brief.
+- **Must Fix:** new behaviour with no red evidence, or a test that passes without the change; a failing check; a test that asserts a mock instead of behaviour; an unbounded wait.
+- **Must Fix:** in a plan, a behaviour task with no failing test named.
 - **Consider:** a test that could be shorter or clearer.
 
 ## Every check runs
