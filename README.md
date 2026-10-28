@@ -143,10 +143,13 @@ handshake and exec traffic when debugging.
 ## Develop locally
 
 ```sh
+git config core.hooksPath .githooks
 bun install
 bun run build
 bun test/smoke.ts
 ```
+
+The first line turns on the git hooks that refuse commits and pushes on `main`.
 
 `@opencode/plugin` is only a devDependency (types and the smoke test): the OpenCode host provides it to plugins at runtime.
 

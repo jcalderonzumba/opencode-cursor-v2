@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$(git symbolic-ref --short -q HEAD || true)" = main ]; then
+  echo "pre-commit: refusing to commit on main; create a feature branch first." >&2
+  exit 1
+fi
