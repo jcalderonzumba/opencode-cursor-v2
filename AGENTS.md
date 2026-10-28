@@ -54,7 +54,7 @@ The owner may name another model per run with `--model <m>` on `/review-plan` an
 
 ## Commits
 
-Builder commits end with two trailers, passed with several `-m` flags:
+Builder commits are `git commit -m "<subject>" -m "<body>" -m "<trailers>"`. The last `-m` argument holds both trailers on separate lines, with a real line break inside the quotes, so git reads them as one trailer block (two separate `-m` trailers are not both parsed):
 
 ```text
 Co-Authored-By: <exact model name> <noreply@anthropic.com>
