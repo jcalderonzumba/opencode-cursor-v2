@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HOOKS="$ROOT/.githooks"

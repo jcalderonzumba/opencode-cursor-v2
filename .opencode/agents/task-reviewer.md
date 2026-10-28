@@ -1,5 +1,5 @@
 ---
-description: "Reviews or re-reviews one task of an implementation plan of this repo, for spec compliance and code quality, from the review brief a /run-phase dispatch supplies. Never dispatched without a brief and an explicit model."
+description: "Reviews or re-reviews one task of an implementation plan of this repo, for spec compliance and code quality, from the review brief a /run-phase dispatch supplies. Never dispatched without a brief."
 mode: subagent
 model: anthropic/claude-opus-5-5
 permissions:
