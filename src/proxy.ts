@@ -298,6 +298,7 @@ interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  /** System prompt forwarded via RequestContext.cloudRule (issue #21). */
   cloudRule?: string;
 }
 
@@ -312,6 +313,7 @@ interface PendingExec {
   toolCallId: string;
   toolName: string;
   decodedArgs: string;
+  /** Set when this exec is a redirected native tool call (issue #21/#29). */
   native?: NativeExecBinding;
 }
 
@@ -345,6 +347,8 @@ export function setHttp1PausedStreamMaxMsForTesting(ms = HTTP1_PAUSED_STREAM_MAX
 
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
+// Conversation state also persists to disk so context survives proxy/opencode
+// restarts instead of failing with "Blob not found" (issues #22/#29).
 const CONVERSATION_DISK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CONVERSATION_DIR = pathResolve(
   process.env.XDG_CACHE_HOME ?? pathResolve(homedir(), ".cache"),
@@ -1324,6 +1328,8 @@ function handleExecMessage(
   }
 
   if (execCase === "requestContextArgs") {
+    // cloudRule is the prompt channel Cursor's agent actually honors; plain
+    // system messages are ignored server-side (issue #21).
     const requestContext = create(RequestContextSchema, {
       rules: [], cloudRule, repositoryInfo: [], tools: mcpTools,
       gitRepos: [], projectLayouts: [], mcpInstructions: [],
@@ -1348,6 +1354,10 @@ function handleExecMessage(
     return;
   }
 
+  // --- Native Cursor tools ---
+  // The model tries these before the MCP tools. When the client provides an
+  // equivalent tool, redirect the call to it; otherwise reject so the model
+  // falls back to the MCP tools registered via RequestContext.
   const redirect = redirectNativeExec(execMsg, mcpTools);
   if (redirect) {
     if (process.env.CURSOR_PROXY_DEBUG) console.error(`[proxy] redirect ${execCase} -> ${redirect.toolName}`);
@@ -1356,9 +1366,6 @@ function handleExecMessage(
   }
 
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
-  const rejectAndSend = (resultType: string, schema: any) => {
-    sendExecResult(execMsg, resultType, create(schema, { result: { case: "rejected", value: create(ReadRejectedSchema, { path: "", reason: REJECT_REASON }) } }), sendFrame);
-  };
 
   if (execCase === "readArgs") { sendExecResult(execMsg, "readResult", create(ReadResultSchema, { result: { case: "rejected", value: create(ReadRejectedSchema, { path: (execMsg.message.value as any).path, reason: REJECT_REASON }) } }), sendFrame); return; }
   if (execCase === "lsArgs") { sendExecResult(execMsg, "lsResult", create(LsResultSchema, { result: { case: "rejected", value: create(LsRejectedSchema, { path: (execMsg.message.value as any).path, reason: REJECT_REASON }) } }), sendFrame); return; }
@@ -1584,6 +1591,7 @@ function createThinkingTagFilter(): {
         lastIdx = re.lastIndex;
       }
       const rest = input.slice(lastIdx);
+      // Buffer a trailing '<' that could be the start of a thinking tag.
       const ltPos = rest.lastIndexOf('<');
       if (ltPos >= 0 && rest.length - ltPos < MAX_THINKING_TAG_LEN && /^<\/?[a-z_]*$/i.test(rest.slice(ltPos))) {
         buffer = rest.slice(ltPos);
@@ -2351,6 +2359,10 @@ function buildCursorRequest(
   toolResults?: { toolCallId: string; content: string }[],
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
+  // Every `bytes` field in the *Structure messages is a sha256 blob ID —
+  // server-produced checkpoints content-address turns, user messages, and
+  // steps alike. Inlining data where an ID is expected makes Cursor fail
+  // with "Connect error internal: Blob not found" (issues #22/#29).
   const storeBlob = (bytes: Uint8Array): Uint8Array => {
     const blobId = new Uint8Array(createHash("sha256").update(bytes).digest());
     blobStore.set(Buffer.from(blobId).toString("hex"), bytes);
@@ -2359,11 +2371,19 @@ function buildCursorRequest(
   const storeJsonBlob = (obj: unknown): Uint8Array => storeBlob(new TextEncoder().encode(JSON.stringify(obj)));
   const prompts = systemPrompts.length > 0 ? systemPrompts : ["You are a helpful assistant."];
   const systemBlobIds = prompts.map((content) => storeJsonBlob({ role: "system", content }));
+  // Cursor's server builds the model prompt from `rootPromptMessagesJson`,
+  // not from `turns[]`. Sending only the system prompt here makes multi-turn
+  // conversations lose all prior context after a proxy restart, so the full
+  // history is rebuilt on every request. Server-echoed checkpoints replace
+  // historical user entries with empty placeholders, which is why the
+  // checkpoint's own rootPromptMessagesJson cannot be reused.
   const rootPromptMessagesJson = [...systemBlobIds];
   for (const entry of history) {
     if (entry.kind === "assistant") { rootPromptMessagesJson.push(storeJsonBlob({ role: "assistant", content: [{ type: "text", text: entry.text }] })); }
     else { const text = entry.kind === "tool" ? `[Tool Result]\n${entry.text}` : entry.text; rootPromptMessagesJson.push(storeJsonBlob({ role: "user", content: [{ type: "text", text }] })); }
   }
+  // turns[]: one entry per user turn, with assistant/tool texts as steps.
+  // Deterministic message IDs keep blob IDs stable across rebuilds.
   const turnBlobIds: Uint8Array[] = [];
   let currentTurn: { userMessageBlobId: Uint8Array; stepBlobIds: Uint8Array[] } | null = null;
   const flushTurn = () => {
@@ -2385,6 +2405,8 @@ function buildCursorRequest(
     }
   }
   flushTurn();
+  // Preserve non-history checkpoint fields (todos, file states, summaries)
+  // when the system prompt is unchanged; otherwise start fresh.
   let baseState: ConversationStateStructure | null = null;
   if (checkpoint) {
     try {
@@ -2398,9 +2420,13 @@ function buildCursorRequest(
     ? settlePendingToolCalls(baseState.pendingToolCalls, toolResults ?? [])
     : [];
   const conversationState = baseState ? create(ConversationStateStructureSchema, { ...baseState, rootPromptMessagesJson, turns: turnBlobIds, pendingToolCalls }) : create(ConversationStateStructureSchema, { rootPromptMessagesJson, turns: turnBlobIds, todos: [], pendingToolCalls: [], previousWorkspaceUris: [], fileStates: {}, fileStatesV2: {}, summaryArchives: [], turnTimings: [], subagentStates: {}, selfSummaryCount: 0, readPaths: [] });
+  // No trailing user message (e.g. tool results after a dead bridge) →
+  // resume over the reconstructed history instead of faking a user turn.
   const action = userText
     ? create(ConversationActionSchema, { action: { case: "userMessageAction" as const, value: create(UserMessageActionSchema, { userMessage: create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() }) }) } })
     : create(ConversationActionSchema, { action: { case: "resumeAction" as const, value: create(ResumeActionSchema, {}) } });
+  // "auto" is the proxy's pseudo-model for Cursor's server-side Auto
+  // routing; the Run API expects modelId "default" for it.
   const cursorModelId = modelId === "auto" ? "default" : modelId;
   const displayName = modelId === "auto" ? "Auto" : modelId;
   const requestedModel = create(RequestedModelSchema, { modelId: cursorModelId });
