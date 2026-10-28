@@ -12,11 +12,17 @@ import {
   BidiRequestIdSchema,
   ClientHeartbeatSchema,
   ExecServerMessageSchema,
+  type ExecServerMessage,
   GetUsableModelsResponseSchema,
   InteractionUpdateSchema,
   McpArgsSchema,
+  McpToolDefinitionSchema,
   ModelDetailsSchema,
+  ReadArgsSchema,
+  ShellArgsSchema,
+  WriteArgsSchema,
 } from "../src/proto/agent_pb";
+import { redirectNativeExec } from "../src/native-tools";
 import { Credential, Integration } from "@opencode/plugin";
 import type CursorV2PluginModule from "../src/v2";
 
@@ -53,6 +59,8 @@ interface TestCursorBackend {
   setHoldRunStream: (hold: boolean) => void;
   /** While holding, also emit an MCP tool call with this id; the stream answers the tool result and ends. */
   setRunStreamToolCall: (toolCallId: string | undefined) => void;
+  /** While holding, also emit this native exec request (id 1, exec id `exec-1`). HTTP/2 only: the HTTP/1 held path ignores it. */
+  setRunStreamExec: (message: ExecServerMessage["message"] | undefined) => void;
   getOpenRunStreamCount: () => number;
   /** Refuse connections of the other protocol, like a network that blocks HTTP/2. */
   setAllowedTransport: (transport: "both" | "h1" | "h2") => void;
@@ -62,6 +70,8 @@ interface TestCursorBackend {
   getRequests: () => string[];
   /** Every `runRequest` the proxy sent, over either transport, in arrival order. */
   getRunRequests: () => Array<AgentClientMessage["message"] & { case: "runRequest" }>;
+  /** Every exec reply or exec control message the proxy sent, over either transport, in arrival order. */
+  getExecReplies: () => Array<AgentClientMessage["message"]>;
   /** Decoded text of every successful MCP tool result the HTTP/2 run stream received. */
   getMcpResultTexts: () => string[];
   resetObservations: () => void;
@@ -146,26 +156,27 @@ function frameRunTextDelta(text: string): Buffer {
   );
 }
 
-/** A Connect-framed MCP tool call, which makes the proxy pause the stream for a tool result. */
-function frameRunToolCall(toolCallId: string): Buffer {
+/** A Connect-framed exec request (id 1, exec id `exec-1`) of the given case. */
+function frameRunExec(message: ExecServerMessage["message"]): Buffer {
   return frameConnectUnaryMessage(
     toBinary(
       AgentServerMessageSchema,
       create(AgentServerMessageSchema, {
         message: {
           case: "execServerMessage",
-          value: create(ExecServerMessageSchema, {
-            id: 1,
-            execId: "exec-1",
-            message: {
-              case: "mcpArgs",
-              value: create(McpArgsSchema, { name: "echo", toolName: "echo", toolCallId }),
-            },
-          }),
+          value: create(ExecServerMessageSchema, { id: 1, execId: "exec-1", message }),
         },
       }),
     ),
   );
+}
+
+/** A Connect-framed MCP tool call, which makes the proxy pause the stream for a tool result. */
+function frameRunToolCall(toolCallId: string): Buffer {
+  return frameRunExec({
+    case: "mcpArgs",
+    value: create(McpArgsSchema, { name: "echo", toolName: "echo", toolCallId }),
+  });
 }
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
@@ -185,10 +196,13 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let allowedTransport: "both" | "h1" | "h2" = "both";
   let http1Fault: "read-error" | "bidi-error" | undefined;
   const runRequests: Array<AgentClientMessage["message"] & { case: "runRequest" }> = [];
+  const execReplies: Array<AgentClientMessage["message"]> = [];
+  let runStreamExec: ExecServerMessage["message"] | undefined;
   const mcpResultTexts: string[] = [];
   const recordRunRequest = (bytes: Uint8Array) => {
     const message = fromBinary(AgentClientMessageSchema, bytes).message;
     if (message.case === "runRequest") runRequests.push(message);
+    else if (message.case === "execClientMessage" || message.case === "execClientControlMessage") execReplies.push(message);
   };
 
   const discoveryProto = () =>
@@ -325,6 +339,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         // first body byte, so emit one to unblock the caller's fetch.
         heldRunStreams.add(stream);
         stream.write(frameRunTextDelta("streaming"));
+        if (runStreamExec) stream.write(frameRunExec(runStreamExec));
         if (runStreamToolCallId) {
           stream.write(frameRunToolCall(runStreamToolCallId));
           // Answer the tool result (and only that; heartbeats are ignored) to
@@ -434,6 +449,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     setRunStreamToolCall(toolCallId) {
       runStreamToolCallId = toolCallId;
     },
+    setRunStreamExec(message) {
+      runStreamExec = message;
+    },
     getOpenRunStreamCount() {
       return heldRunStreams.size + heldHttp1Responses.size;
     },
@@ -449,12 +467,16 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     getRunRequests() {
       return [...runRequests];
     },
+    getExecReplies() {
+      return [...execReplies];
+    },
     getMcpResultTexts() {
       return [...mcpResultTexts];
     },
     resetObservations() {
       requests.length = 0;
       runRequests.length = 0;
+      execReplies.length = 0;
       mcpResultTexts.length = 0;
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
@@ -892,6 +914,254 @@ async function testCancelPausedBridgeKeepsBridge(
     backend.setHoldRunStream(false);
   }
   console.log("[test] Paused bridge disconnect OK");
+}
+
+async function testPausedBridgeAcceptsCompoundToolCallId(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing resume with a compound tool call id...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamToolCall("call-compound");
+  const controller = new AbortController();
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const first = await withTimeout(
+      postChat(port, toolCallMessages("call-compound", false), controller.signal).then(readUntilDone),
+      "the compound-id tool call to reach the stream",
+    );
+    assert(first.includes("call-compound"), `Expected the tool call, got: ${first}`);
+
+    // OpenCode sends the call id joined with its own id on the newline.
+    const body = await withTimeout(
+      postChat(port, toolCallMessages("call-compound-2\nfc_abc_2", true, "done"), controller.signal).then((res) =>
+        res.text(),
+      ),
+      "the compound-id continuation to finish",
+    );
+    assert(body.includes("after-tool"), `Expected the continuation on the same stream, got: ${body}`);
+    assertArrayEqual(
+      backend.getMcpResultTexts(),
+      ["done"],
+      "A compound tool call id must reach the paused exec with its result",
+    );
+  } finally {
+    controller.abort();
+    modules.stopProxy();
+    backend.setRunStreamToolCall(undefined);
+    backend.setHoldRunStream(false);
+  }
+  console.log("[test] Compound tool call id OK");
+}
+
+const testTools = (...names: string[]) =>
+  names.map((name) =>
+    create(McpToolDefinitionSchema, {
+      name,
+      toolName: name,
+      providerIdentifier: "opencode",
+      description: "",
+      inputSchema: new Uint8Array(),
+    }),
+  );
+
+function testNativeToolRedirectsTargetV2Tools() {
+  console.log("[test] Testing native tool redirects target OpenCode V2 names...");
+  const tools = testTools("read", "write", "shell");
+  const exec = (message: ExecServerMessage["message"]) =>
+    create(ExecServerMessageSchema, { id: 1, execId: "e1", message });
+
+  const read = redirectNativeExec(exec({ case: "readArgs", value: create(ReadArgsSchema, { path: "/tmp/a" }) }), tools);
+  assert(read, "read must redirect when the read tool is available");
+  assertEqual(read.toolName, "read", "read tool name");
+  assertEqual(read.decodedArgs, JSON.stringify({ path: "/tmp/a" }), "read args must use the V2 path key");
+
+  const write = redirectNativeExec(exec({ case: "writeArgs", value: create(WriteArgsSchema, { path: "/tmp/b", fileText: "hi" }) }), tools);
+  assert(write, "write must redirect when the write tool is available");
+  assertEqual(write.decodedArgs, JSON.stringify({ path: "/tmp/b", content: "hi" }), "write args must use path and content");
+
+  const shell = redirectNativeExec(exec({ case: "shellStreamArgs", value: create(ShellArgsSchema, { command: "ls" }) }), tools);
+  assert(shell, "shell must redirect when the shell tool is available");
+  assertEqual(shell.toolName, "shell", "shell tool name");
+  assertEqual(shell.decodedArgs, JSON.stringify({ command: "ls" }), "shell args carry only the command");
+  assertEqual(shell.binding.resultType, "shellStreamResult", "a streamed shell keeps its stream result type");
+
+  const bashOnly = redirectNativeExec(
+    exec({ case: "shellArgs", value: create(ShellArgsSchema, { command: "ls" }) }),
+    testTools("bash"),
+  );
+  assertEqual(bashOnly, null, "V2 has no bash tool, so a shell exec must not redirect to one");
+  console.log("[test] Native tool redirects OK");
+}
+
+// Test payloads stay under 128 bytes, so every length and value is one varint byte.
+const protoBytes = (...parts: Uint8Array[]) => Uint8Array.from(parts.flatMap((part) => [...part]));
+const protoString = (no: number, value: string) => {
+  const bytes = new TextEncoder().encode(value);
+  return protoBytes(Uint8Array.of((no << 3) | 2, bytes.length), bytes);
+};
+const protoNumber = (no: number, value: number) => Uint8Array.of(no << 3, value);
+const protoMessage = (no: number, ...fields: Uint8Array[]) => {
+  const body = protoBytes(...fields);
+  return protoBytes(Uint8Array.of((no << 3) | 2, body.length), body);
+};
+const protoVarint = (value: number) => {
+  const bytes: number[] = [];
+  for (; value > 0x7f; value >>= 7) bytes.push((value & 0x7f) | 0x80);
+  return Uint8Array.of(...bytes, value);
+};
+
+async function testUnknownExecFieldsRedirectToV2Tools() {
+  console.log("[test] Testing unknown exec fields redirect to OpenCode V2 tools...");
+  const { answerUnknownExec } = await import("../src/proxy");
+  const v2Tools = testTools("read", "shell", "edit", "write");
+  const cases: Array<{
+    no: number;
+    fields: Uint8Array[];
+    tools?: typeof v2Tools;
+    expected: string;
+    toolCallId?: string;
+  }> = [
+    {
+      no: 29,
+      fields: [toBinary(ReadArgsSchema, create(ReadArgsSchema, { path: "/tmp/a", toolCallId: "tc-29" }))],
+      expected: `read ${JSON.stringify({ path: "/tmp/a" })}`,
+      toolCallId: "tc-29",
+    },
+    {
+      no: 45,
+      fields: [protoString(1, "/tmp/b"), protoNumber(2, 5), protoNumber(3, 10)],
+      expected: `read ${JSON.stringify({ path: "/tmp/b", offset: 5, limit: 10 })}`,
+    },
+    { no: 46, fields: [protoString(1, "ls")], expected: `shell ${JSON.stringify({ command: "ls" })}` },
+    {
+      no: 47,
+      fields: [protoString(1, "/tmp/c"), protoMessage(2, protoString(1, "old"), protoString(2, "new"))],
+      expected: `edit ${JSON.stringify({ path: "/tmp/c", oldString: "old", newString: "new" })}`,
+    },
+    {
+      no: 48,
+      fields: [protoString(1, "/tmp/d"), protoString(2, "body")],
+      expected: `write ${JSON.stringify({ path: "/tmp/d", content: "body" })}`,
+    },
+    // V2 has no bash tool: the exec is rejected with a throw frame instead.
+    { no: 46, fields: [protoString(1, "ls")], tools: testTools("bash"), expected: "0 redirects, 1 frames" },
+  ];
+
+  const mismatches: string[] = [];
+  for (const { no, fields, tools, expected, toolCallId } of cases) {
+    const payload = protoBytes(...fields);
+    // Real wire bytes: the known fields plus one length-delimited unknown field, decoded by protobuf-es.
+    const wire = protoBytes(
+      toBinary(ExecServerMessageSchema, create(ExecServerMessageSchema, { id: 1, execId: "e1" })),
+      protoVarint((no << 3) | 2),
+      protoVarint(payload.length),
+      payload,
+    );
+    const exec = fromBinary(ExecServerMessageSchema, wire);
+    assertEqual(exec.$unknown?.length, 1, `field ${no} must decode as one unknown field`);
+    const redirects: Array<{ toolName: string; decodedArgs: string; toolCallId: string }> = [];
+    let frames = 0;
+    answerUnknownExec(exec, tools ?? v2Tools, () => { frames += 1; }, (redirect) => redirects.push(redirect));
+    const actual = redirects.length === 1 && frames === 0
+      ? `${redirects[0]!.toolName} ${redirects[0]!.decodedArgs}`
+      : `${redirects.length} redirects, ${frames} frames`;
+    if (actual !== expected) mismatches.push(`field ${no}: expected ${expected}, got ${actual}`);
+    if (toolCallId && redirects[0]?.toolCallId !== toolCallId) {
+      mismatches.push(`field ${no}: expected toolCallId ${toolCallId}, got ${redirects[0]?.toolCallId}`);
+    }
+  }
+  assertArrayEqual(mismatches, [], "Unknown exec fields must hand V2 tool names and arguments to the host");
+  console.log("[test] Unknown exec field redirects OK");
+}
+
+async function testRejectedShellStreamAnswersWithStreamFrames(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing a rejected streamed shell...");
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamExec({ case: "shellStreamArgs", value: create(ShellArgsSchema, { command: "ls" }) });
+  const controller = new AbortController();
+  try {
+    // No tools in the request: the proxy has nothing to redirect the shell to.
+    const port = await modules.startProxy(async () => "test-token");
+    await withTimeout(
+      postChat(port, [{ role: "user", content: "run ls" }], controller.signal),
+      "the rejected-shell stream to start",
+    );
+    await waitFor(
+      () => backend.getExecReplies().some((reply) =>
+        reply.case === "execClientControlMessage"
+          ? reply.value.message.case === "streamClose"
+          : reply.case === "execClientMessage" && reply.value.message.case === "shellResult"),
+      "the proxy to answer the rejected streamed shell",
+    );
+
+    const frames = backend.getExecReplies().map((reply) => {
+      if (reply.case === "execClientControlMessage") {
+        const control = reply.value.message;
+        return control.case === "streamClose" ? `streamClose ${control.value.id}` : `control ${control.case}`;
+      }
+      if (reply.case !== "execClientMessage") return String(reply.case);
+      const { execId, message } = reply.value;
+      if (message.case !== "shellStream") return `${execId} ${message.case}`;
+      const { event } = message.value;
+      if (event.case === "stdout") return `${execId} stdout ${event.value.data}`;
+      if (event.case === "exit") return `${execId} exit ${event.value.code}`;
+      return `${execId} ${event.case}`;
+    });
+    assertArrayEqual(
+      frames,
+      [
+        "exec-1 start",
+        "exec-1 stdout Tool not available in this environment. Use the MCP tools provided instead.",
+        "exec-1 exit 1",
+        "streamClose 1",
+      ],
+      "A rejected streamed shell must answer with stream frames, never a shellResult",
+    );
+  } finally {
+    controller.abort();
+    modules.stopProxy();
+    backend.setRunStreamExec(undefined);
+    backend.setHoldRunStream(false);
+  }
+  console.log("[test] Rejected streamed shell OK");
+}
+
+async function testCheckpointFallbackSettlesCompoundToolCallIds() {
+  console.log("[test] Testing checkpoint fallback with compound tool call ids...");
+  const { settlePendingToolCalls } = await import("../src/proxy");
+  const pending = (...ids: string[]) =>
+    JSON.stringify({
+      role: "assistant",
+      content: ids.map((toolCallId) => ({ type: "tool-call", toolCallId, toolName: "echo", args: {} })),
+      providerOptions: {
+        cursor: { pendingToolExecutionContracts: Object.fromEntries(ids.map((id) => [id, {}])) },
+      },
+    });
+  const left = (raws: string[]) =>
+    raws.map((raw) => {
+      const parsed = JSON.parse(raw);
+      const calls = parsed.content.map((part: { toolCallId: string }) => part.toolCallId);
+      const contracts = Object.keys(parsed.providerOptions.cursor.pendingToolExecutionContracts);
+      return `calls ${calls.join(",")} contracts ${contracts.join(",")}`;
+    });
+
+  assertArrayEqual(
+    left(settlePendingToolCalls([pending("call-a", "call-b")], [{ toolCallId: "call-a-2\nfc_1_2" }])),
+    ["calls call-b contracts call-b"],
+    "A rewritten id must settle its pending call and its contract key",
+  );
+  assertArrayEqual(
+    left(settlePendingToolCalls([pending("call_1", "call_1_x")], [{ toolCallId: "call_1_x" }])),
+    ["calls call_1 contracts call_1"],
+    "An id that only shares a prefix with another must not settle it",
+  );
+  console.log("[test] Checkpoint fallback compound ids OK");
 }
 
 async function testStopProxyClearsPausedBridges(
@@ -1884,6 +2154,16 @@ async function testHttpTransportFromEnv() {
   console.log("[test] CURSOR_DISABLE_HTTP2=1 OK");
 }
 
+// SMOKE_ONLY=a,b runs only the tests whose function name contains one of the
+// comma-separated parts, case-insensitively (e.g. SMOKE_ONLY=RejectedShell).
+const smokeOnly = (process.env.SMOKE_ONLY ?? "").toLowerCase().split(",").map((part) => part.trim()).filter(Boolean);
+let smokeRan = 0;
+async function run<A extends unknown[]>(test: (...args: A) => unknown, ...args: A): Promise<void> {
+  if (smokeOnly.length && !smokeOnly.some((part) => test.name.toLowerCase().includes(part))) return;
+  smokeRan += 1;
+  await test(...args);
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1897,28 +2177,34 @@ async function main() {
       process.exitCode = 0;
       return;
     }
-    await testBridgeFraming();
-    await testHttp1WireFormat();
-    await testProxyStartStop(modules);
-    await testProxyBindsLoopbackOnly(modules);
-    await testStreamingFrameParser();
-    await testStreamCancellationStopsBridge(modules, backend);
-    await testBridgeResolvesUnderOddInstallPath(backend);
-    await testHttp1StreamCancellationAndStop(modules, backend);
-    await testHttp1NonStreamingSurfacesUpstreamErrors(modules, backend);
-    await testHttp1PausedStreamIsCapped(modules, backend);
-    await testCancelPausedBridgeKeepsBridge(modules, backend);
-    await testStopProxyClearsPausedBridges(modules, backend);
-    await testAuthParams(modules);
-    await testTokenExpiry(modules);
-    await testArrayContentParsing(modules);
-    await testRunActionAfterToolHistory(modules, backend);
-    await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
-    await testDiscoveryFallbackAndSuccess(modules, backend);
-    await testV2Plugin(modules, backend);
-    await testHttpTransportSelection(modules, backend, false);
-    await testHttpTransportFromEnv();
-    console.log("\n✓ All smoke tests passed");
+    await run(testBridgeFraming);
+    await run(testHttp1WireFormat);
+    await run(testProxyStartStop, modules);
+    await run(testProxyBindsLoopbackOnly, modules);
+    await run(testStreamingFrameParser);
+    await run(testStreamCancellationStopsBridge, modules, backend);
+    await run(testBridgeResolvesUnderOddInstallPath, backend);
+    await run(testHttp1StreamCancellationAndStop, modules, backend);
+    await run(testHttp1NonStreamingSurfacesUpstreamErrors, modules, backend);
+    await run(testHttp1PausedStreamIsCapped, modules, backend);
+    await run(testCancelPausedBridgeKeepsBridge, modules, backend);
+    await run(testPausedBridgeAcceptsCompoundToolCallId, modules, backend);
+    await run(testNativeToolRedirectsTargetV2Tools);
+    await run(testUnknownExecFieldsRedirectToV2Tools);
+    await run(testRejectedShellStreamAnswersWithStreamFrames, modules, backend);
+    await run(testCheckpointFallbackSettlesCompoundToolCallIds);
+    await run(testStopProxyClearsPausedBridges, modules, backend);
+    await run(testAuthParams, modules);
+    await run(testTokenExpiry, modules);
+    await run(testArrayContentParsing, modules);
+    await run(testRunActionAfterToolHistory, modules, backend);
+    await run(testExpiredTokenRefreshBeforeDiscovery, modules, backend);
+    await run(testDiscoveryFallbackAndSuccess, modules, backend);
+    await run(testV2Plugin, modules, backend);
+    await run(testHttpTransportSelection, modules, backend, false);
+    await run(testHttpTransportFromEnv);
+    if (smokeOnly.length && smokeRan === 0) throw new Error(`SMOKE_ONLY=${process.env.SMOKE_ONLY} matched no test`);
+    console.log(smokeOnly.length ? `\n✓ ${smokeRan} selected smoke test(s) passed` : "\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
     console.error("\n✗ Smoke test failed:", err);

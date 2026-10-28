@@ -1234,12 +1234,12 @@ function redirectUnknownTool(
 
   if (fieldNo === 29) {
     const args = fromBinary(ReadArgsSchema, payload);
-    return emit(pickTool(mcpTools, ["read"]), { filePath: args.path ?? "" }, args.toolCallId);
+    return emit(pickTool(mcpTools, ["read"]), { path: args.path ?? "" }, args.toolCallId);
   }
 
   const fields = readProtoFields(payload);
   if (fieldNo === 45) {
-    const decoded: Record<string, unknown> = { filePath: fieldString(fields, 1) };
+    const decoded: Record<string, unknown> = { path: fieldString(fields, 1) };
     const offset = fieldVarint(fields, 2);
     const limit = fieldVarint(fields, 3);
     if (offset) decoded.offset = offset;
@@ -1247,20 +1247,20 @@ function redirectUnknownTool(
     return emit(pickTool(mcpTools, ["read"]), decoded);
   }
   if (fieldNo === 46) {
-    return emit(pickTool(mcpTools, ["bash"]), { command: fieldString(fields, 1), description: "Runs shell command" });
+    return emit(pickTool(mcpTools, ["shell"]), { command: fieldString(fields, 1) });
   }
   if (fieldNo === 47) {
     const edit = fields.find((field) => field.no === 2 && field.wire === WIRE_LEN);
     const replacement = edit ? readProtoFields(edit.payload) : [];
     return emit(pickTool(mcpTools, ["edit"]), {
-      filePath: fieldString(fields, 1),
+      path: fieldString(fields, 1),
       oldString: fieldString(replacement, 1),
       newString: fieldString(replacement, 2),
     });
   }
   if (fieldNo === 48) {
     return emit(pickTool(mcpTools, ["write"]), {
-      filePath: fieldString(fields, 1),
+      path: fieldString(fields, 1),
       content: fieldString(fields, 2),
     });
   }
@@ -1372,7 +1372,18 @@ function handleExecMessage(
   if (execCase === "grepArgs") { sendExecResult(execMsg, "grepResult", create(GrepResultSchema, { result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) } }), sendFrame); return; }
   if (execCase === "writeArgs") { sendExecResult(execMsg, "writeResult", create(WriteResultSchema, { result: { case: "rejected", value: create(WriteRejectedSchema, { path: (execMsg.message.value as any).path, reason: REJECT_REASON }) } }), sendFrame); return; }
   if (execCase === "deleteArgs") { sendExecResult(execMsg, "deleteResult", create(DeleteResultSchema, { result: { case: "rejected", value: create(DeleteRejectedSchema, { path: (execMsg.message.value as any).path, reason: REJECT_REASON }) } }), sendFrame); return; }
-  if (execCase === "shellArgs" || execCase === "shellStreamArgs") { sendExecResult(execMsg, "shellResult", create(ShellResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: (execMsg.message.value as any).command ?? "", workingDirectory: (execMsg.message.value as any).workingDirectory ?? "", reason: REJECT_REASON, isReadonly: false }) } }), sendFrame); return; }
+  if (execCase === "shellArgs") { sendExecResult(execMsg, "shellResult", create(ShellResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: (execMsg.message.value as any).command ?? "", workingDirectory: (execMsg.message.value as any).workingDirectory ?? "", reason: REJECT_REASON, isReadonly: false }) } }), sendFrame); return; }
+  if (execCase === "shellStreamArgs") {
+    // A streamed shell is answered with stream frames; a plain shellResult
+    // leaves Cursor waiting on the stream until the client gives up.
+    sendNativeExecResult(
+      { execId: execMsg.execId, execMsgId: execMsg.id },
+      { resultType: "shellStreamResult", args: { exitCode: "1" } },
+      REJECT_REASON,
+      sendFrame,
+    );
+    return;
+  }
   if (execCase === "backgroundShellSpawnArgs") { sendExecResult(execMsg, "backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: (execMsg.message.value as any).command ?? "", workingDirectory: (execMsg.message.value as any).workingDirectory ?? "", reason: REJECT_REASON, isReadonly: false }) } }), sendFrame); return; }
   if (execCase === "writeShellStdinArgs") { sendExecResult(execMsg, "writeShellStdinResult", create(WriteShellStdinResultSchema, { result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) } }), sendFrame); return; }
   if (execCase === "fetchArgs") { sendExecResult(execMsg, "fetchResult", create(FetchResultSchema, { result: { case: "error", value: create(FetchErrorSchema, { url: (execMsg.message.value as any).url ?? "", error: REJECT_REASON }) } }), sendFrame); return; }
@@ -2147,7 +2158,7 @@ function handleToolResultResume(
   const lastExecId = pendingExecs[pendingExecs.length - 1]?.execId;
   for (const exec of pendingExecs) {
     const result = toolResults.find(
-      (r) => r.toolCallId === exec.toolCallId,
+      (r) => toolCallIdsMatch(r.toolCallId, exec.toolCallId),
     );
     // A user message sent alongside tool results (e.g. the explanation typed
     // after rejecting an edit) would otherwise be dropped: the paused bridge
@@ -2312,13 +2323,22 @@ function toolCallIdParts(id: string): string[] {
   return id.split(/[\s\n]+/).map((part) => part.trim()).filter(Boolean);
 }
 
+/** OpenCode rewrites ids (`<callId>-2\n<fcId>_2`); a part of one id matches the other id with or without a numeric `-n`/`_n` suffix. */
+function toolCallIdsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const aParts = toolCallIdParts(a);
+  const bParts = toolCallIdParts(b);
+  const matches = (long: string, short: string) =>
+    long === short || (long.startsWith(short) && /^[-_]\d+$/.test(long.slice(short.length)));
+  return aParts.some((aPart) => bParts.some((bPart) => matches(aPart, bPart) || matches(bPart, aPart)));
+}
+
 export function settlePendingToolCalls(
   pending: readonly string[],
   toolResults: readonly { toolCallId: string }[],
 ): string[] {
   if (pending.length === 0 || toolResults.length === 0) return [...pending];
-  const settledIds = new Set(toolResults.flatMap((result) => toolCallIdParts(result.toolCallId)));
-  const isSettled = (toolCallId: string) => toolCallIdParts(toolCallId).some((part) => settledIds.has(part));
+  const isSettled = (toolCallId: string) => toolResults.some((result) => toolCallIdsMatch(result.toolCallId, toolCallId));
   const next: string[] = [];
   for (const raw of pending) {
     let parsed: {
