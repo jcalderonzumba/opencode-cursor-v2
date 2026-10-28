@@ -25,7 +25,7 @@ echo "opencode $*" >>"$STUB_LOG"
 case "${STUB_OC_MODE:-ok}" in
   ok) echo '{"data":[{"id":"cursor","name":"Cursor"}]}' ;;
   absent) echo '{"data":[{"id":"other"}]}' ;;
-  error) echo "connection refused" >&2; exit 1 ;;
+  error) echo '{"id":"cursor"}'; echo "connection refused" >&2; exit 1 ;;
   marker)
     echo "{\"id\":\"cursor\",\"note\":\"$STUB_MARKER\"}"
     echo "$STUB_MARKER" >&2
