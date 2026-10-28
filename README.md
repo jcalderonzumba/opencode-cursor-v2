@@ -10,9 +10,11 @@ the plugin loads and registers the `cursor` integration and its OAuth method.
 Model discovery and chat need a real Cursor login, which that check did not
 cover.
 
-Install the plugin from a local checkout. Clone this repository, then build it:
+Install the plugin from a local checkout. Clone this repository, then install
+its dependencies and build it:
 
 ```sh
+npm install
 npm run build
 ```
 
@@ -59,12 +61,9 @@ Bun's `node:http2` support is not reliable against Cursor's API.
 ### HTTP/1.1 fallback
 
 HTTP/2 stays the default. Use the HTTP/1.1 transport when the H2 bridge cannot
-connect, for example behind corporate proxies that block HTTP/2. Start OpenCode
-with `CURSOR_DISABLE_HTTP2=1` in its environment:
-
-```sh
-CURSOR_DISABLE_HTTP2=1 opencode
-```
+connect, for example behind corporate proxies that block HTTP/2. Set
+`CURSOR_DISABLE_HTTP2=1` in the environment of the OpenCode server process,
+then restart it. The plugin reads the variable from its process environment.
 
 Model discovery and agent turns use the same transport.
 
