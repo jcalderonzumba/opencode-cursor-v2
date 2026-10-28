@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# stdin lines: <local ref> <local sha> <remote ref> <remote sha>; a deletion has an all-zero local sha.
+refused=0
+while read -r _ _ remote_ref _; do
+  if [ "$remote_ref" = refs/heads/main ]; then
+    refused=1
+  fi
+done
+
+if [ "$refused" = 1 ]; then
+  echo "pre-push: refusing to push to main; open a pull request from a feature branch." >&2
+  exit 1
+fi
