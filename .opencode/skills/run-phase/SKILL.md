@@ -7,7 +7,7 @@ description: Build one phase of an approved implementation plan through subagent
 
 Build one phase of a plan through the `subagent-driven-development` skill (SDD) and stop at the code review gate. This session is SDD's controller: it dispatches a builder and a task reviewer per task, keeps SDD's ledger, and brings to the owner the points SDD would otherwise rule on alone. It ends with the PR draft written and the next command, `/review-phase`, named.
 
-`$ARGUMENTS` is `<plan> [phase]`: the plan is the first token and the phase, when the second token is a whole number, is that number. The phase named is the only one run or checked; never substitute another (`10` is Phase 10, never Phase 1). A plan without `## Phase` sections is phase 1, so the phase may be omitted for it; a plan with phase sections and no phase is a stop that asks the owner for it.
+`$ARGUMENTS` is `<plan> [phase]`: the plan is the first token and the phase, when the second token is a whole number, is that number. The phase named is the only one run or checked; never substitute another (`10` is Phase 10, never Phase 1). A plan without `## Phase` sections is phase 1, so the phase may be omitted for it; a plan with phase sections and no phase is a stop whose message asks for the phase.
 
 Only the owner starts this skill, with the `/run-phase` command. A model that was not told by the owner to run a phase stops.
 
@@ -23,9 +23,9 @@ Only the owner starts this skill, with the `/run-phase` command. A model that wa
 
 Run all six checks in order, each with a real tool call, and print a six-line result as the first output, before anything else: `1 plan: <evidence>`, `2 phase: <evidence>`, … `6 hooks: <evidence>`. The first failing line is the stop message: say which check failed and name the fix. `question` is used from step 2 onward, never here.
 
-**Stop** means the final message is the stop message and nothing else runs after it. A stopping session never repairs the state: no `rm`, `git switch`, `git checkout`, `git stash`, `git branch`, `git add`, `git commit`, `npm install` or `bun install`, and no writing of ledger, review or plan files. Ledger and review files are written only after step 2 is answered.
+In step 1, and whenever `question` returns no owner answer, **stop** means the final message is the stop message and nothing else runs after it; a step 4 stop asks the owner first (and a step 4 question that returns no owner answer is a stop in this sense). A stopping session never repairs the state: no `rm`, `git switch`, `git checkout`, `git stash`, `git branch`, `git add`, `git commit`, `npm install` or `bun install`, and no writing of ledger, review or plan files. Ledger and review files are written only after step 2 is answered, or when step 6 goes straight to step 5 with the owner's earlier answer standing (an owner skip given in chat on that run is recorded too). After a failing line, the later checks only read.
 
-`.superpowers/` is git-ignored, so list and read its directories with `read` on the directory or the exact path, never with `glob`.
+`.superpowers/` and `node_modules/` are git-ignored: list and read them with `read` or shell `ls`, never `glob`.
 
 1. **The plan resolves.** List `.superpowers/plans/` with `read` on the directory and count the file names that contain the first token. Exactly one, or the token is a path naming one file: it resolves. None, or two or more: stop and list the candidates.
 2. **The phase is open.** Read exactly the heading of the phase number given: `## Phase <n>` followed by a space, `:` or the end of the line (`Phase 1` must not match `Phase 10`). It carries no `✅ DONE`.
@@ -36,10 +36,10 @@ Run all six checks in order, each with a real tool call, and print a six-line re
 4. **The plan is approved.** Review directories are `.superpowers/review-plan/<plan basename>-<suffix>/`. One covers the phase when its suffix is `all`, or when its `+`-separated elements include the phase number as a whole element (`3+4` covers 3; `10+11` does not cover 1). Find the highest `round-<n>.md` of each covering directory and read it with `read` on that exact path. Its last line is judged literally: `**Verdict: Approved**` passes, anything else (`**Verdict: Not approved**` included) stops.
    - No covering directory, or more than one: stop (list them for the owner to name).
    - No report, or Not approved: stop, unless the owner said in chat in this session to skip the review. A ledger line from an earlier run, or your own reasoning, is not a skip. Record that as `Owner ruling: review-plan skipped` in the ledger (when the ledger does not exist yet, right after SDD's setup and the `Phase <n> confirmed:` line).
-5. **Git state.** Read the current branch first with `git symbolic-ref -q HEAD`, and the tree with `git status --porcelain`. A dirty tree on any branch is a stop; never clean it. Never `git switch` or `git checkout` away from the branch the session started on, except the one `git switch` or `git switch -c` of the `main` bullet.
+5. **Git state.** Read the current branch first with `git symbolic-ref -q HEAD`, and the tree with `git status --porcelain`. A dirty tree on any branch is a stop; never clean it. Never `git switch` or `git checkout` away from the branch the session started on, except the one `git switch` or `git switch -c` of the `main` bullet. Check 5 names the branch it would switch to and switches only when checks 1 to 4 and 6 pass.
    - Only when the current branch IS `main`, with a clean tree and equal to `origin/main` (`git fetch origin`, then `git rev-list --left-right --count main...origin/main` prints `0 0`): list `git branch --list 'feat/<name>-p<phase>-*'`. One: switch to it with `git switch`. None: create it with `git switch -c` after step 2, and the confirmation shows its name. More than one: stop and list them. A dirty tree or a `main` that differs from `origin/main`: stop and name the remedy (commit or stash, or fast-forward or reconcile `main`).
    - Already on a branch `feat/<name>-p<phase>-*` with a clean tree: continue.
-   - Any other branch, even when a matching phase branch exists, or a dirty tree: stop and name the remedy (commit or stash, or switch to `main` or to the phase branch yourself).
+   - Any other branch, even when a matching phase branch exists, or a dirty tree: stop and name the remedy (the owner commits or stashes, or switches to `main` or to the phase branch).
 6. **The hooks are active.** `git config core.hooksPath`, as a shell call of its own, prints exactly `.githooks`. Anything else: stop and name the fix, `git config core.hooksPath .githooks`.
 
 ## 2 Confirm once
