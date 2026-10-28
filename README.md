@@ -11,11 +11,11 @@ Model discovery and chat need a real Cursor login, which that check did not
 cover.
 
 Install the plugin from a local checkout. Clone this repository, then install
-its dependencies and build it:
+the locked dependencies and build it:
 
 ```sh
-npm install
-npm run build
+bun install --frozen-lockfile
+bun run build
 ```
 
 Create `~/.config/opencode/plugins/opencode-cursor-v2.js` with one line, where
@@ -131,14 +131,14 @@ handshake and exec traffic when debugging.
 
 ```sh
 git config core.hooksPath .githooks
-bun install
+bun install --frozen-lockfile
 bun run build
 bun test/smoke.ts
 ```
 
 The first line turns on the git hooks that refuse commits and pushes on `main`.
 
-`bash scripts/load-local.sh` (on `main`) rebuilds the plugin and checks that the running OpenCode lists the `cursor` integration.
+`bash scripts/load-local.sh` (on `main`) installs the locked dependencies, rebuilds the plugin, and checks that the running OpenCode lists the `cursor` integration.
 
 `@opencode/plugin` is only a devDependency (types and the smoke test): the OpenCode host provides it to plugins at runtime.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the plugin from main and check the running host sees the cursor integration.
+# Install locked dependencies, rebuild the plugin from main, and check the running host sees the cursor integration.
 set -euo pipefail
 
 branch="$(git symbolic-ref -q --short HEAD || true)"
@@ -8,7 +8,8 @@ if [ "$branch" != main ]; then
   exit 2
 fi
 
-npm run build
+bun install --frozen-lockfile
+bun run build
 
 # shortcut: the call has no bound because macOS has no timeout, bound it if the host ever hangs
 resp="$(opencode api get /api/integration 2>/dev/null)" || resp=""
