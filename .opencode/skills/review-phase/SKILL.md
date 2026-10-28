@@ -23,9 +23,9 @@ Apply every check of `.opencode/skills/review-plan/contract.md` with its trigger
 
 1. **The phase landed as planned.** Every task of the phase under review (or the stated purpose, for `no plan phase`) is present in the diff, and every change outside the phase's text is declared in the PR draft's Deviations. **Must Fix**: a planned task missing or only partly landed, or an undeclared deviation.
 2. **Trailers.** Every commit of `<base>..<head>` carries a `Co-Authored-By` and an `Agent-Session` trailer: `git log <base>..<head> "--format=%h %(trailers:only)"`. **Must Fix**: a commit without either.
-3. **Session independence.** Each commit's `Agent-Session` differs from the dispatcher's session id, read from the `Dispatcher's session id` line in the task briefs under the brief's SDD ledger directory. **Must Fix**: a commit that carries the dispatcher's id (the controller committed).
+3. **Session independence.** Each commit's `Agent-Session` differs from the dispatcher's session id, read from the `Dispatcher's session id: <id>` line in the ledger's `progress.md`, beside the `Phase <n> confirmed:` line. **Must Fix**: a commit that carries the dispatcher's id (the controller committed).
 
-Check 3 is skipped, with that reason, when the brief names no SDD ledger, as it does for `no plan phase`. Checks 1 and 2 run for every branch.
+Check 3 is skipped, with that reason, when the brief names no SDD ledger, as it does for `no plan phase`, or when `progress.md` has no `Dispatcher's session id:` line. Checks 1 and 2 run for every branch.
 
 ## Phase 2: Craft
 
@@ -78,22 +78,22 @@ Everything below is the clerk's. `phase-reviewer` does not own it.
 
 ## 1 Preconditions
 
-In order. Stop at the first that fails, say which, and say what fixes it. A stopping session repairs nothing.
+In order. Stop at the first that fails, say which, and say what fixes it. A stopping clerk repairs nothing.
 
 1. **A clean tree:** `git status --porcelain` prints nothing.
 2. **Not on `main`:** the branch is not `main`.
 3. **Not behind or diverged from its upstream.** Run `git fetch origin`. When the branch has an upstream (`git rev-parse --abbrev-ref '@{upstream}'` answers), `git rev-list --left-right --count 'HEAD...@{upstream}'` prints `<ahead> <behind>`. Behind only, or diverged: stop and tell the owner, who chooses. This skill never force-pushes. With no upstream, or not behind, go on.
-4. **`bun` works,** as in `/run-phase` precondition 3: a plain `bun --version` shell call succeeds. When it fails, the ruling `controller runs smoke` (the controller runs `bun test/smoke.ts` on each head with the scratch PATH) may stand: for a plan phase it is the `Owner ruling: controller runs smoke` line of the ledger; for `--no-phase`, which has no ledger, it is held in chat and asked again each run. Without the ruling, stop and name the two remedies of `/run-phase`.
+4. **`bun` works,** as in `/run-phase` precondition 3: a plain `bun --version` shell call succeeds. When it fails, the ruling `controller runs smoke` (the clerk runs `bun test/smoke.ts` on each head with the scratch PATH) may stand: for a plan phase it is the `Owner ruling: controller runs smoke` line of the ledger; for `--no-phase`, which has no ledger, it is held in chat and asked again each run. Without the ruling, stop and name the two remedies of `/run-phase`.
 5. **The three checks pass on `HEAD` now.** The clerk runs `npx tsc -p tsconfig.json --noEmit`, `bun test/smoke.ts` and `npm run build`, one command per call, and writes each command with its result to `<top>/.superpowers/review/<branch-dir>/checks.txt`. A red check is a stop; the fix goes through [the loop](#4-the-loop).
-6. **The PR draft exists** at `<top>/.superpowers/review/<branch-dir>/pr-body.md`. When it does not, create the directory, write the draft from `.opencode/skills/run-phase/pr-template.md` (Variant A for a plan phase, Variant B for `--no-phase`) and stop: the clerk fills it from the ledger and reports before the next run.
+6. **The PR draft exists** at `<top>/.superpowers/review/<branch-dir>/pr-body.md`. When it does not, create the directory, write the draft from `.opencode/skills/run-phase/pr-template.md` (Variant A for a plan phase, Variant B for `--no-phase`), and STOP: print the draft path and end with nothing else — do not run the checks, generate a brief, or dispatch. The clerk fills the draft and reports before the next run.
 7. **For a plan phase, every confirmed task is complete:** each task of the ledger's `Phase <n> confirmed:` line has a `Task <n>: complete` line.
 8. **The public-repo check.** `git log --name-only --format= origin/main..HEAD` lists no path under `.superpowers/` or `docs/superpowers/`. This reads history, not just the tree. A hit is a stop for the owner.
 
 ## 2 Checks and brief
 
-**The model.** `--model <m>` is accepted only when `<m>` is in the reviewer list of `AGENTS.md` ("Roles and models") and matches `^[a-z0-9-]+/[A-Za-z0-9._-]+(#[A-Za-z0-9._-]+)?$`; given twice, without a value, or any other token: stop with one line naming it, before creating any file or dispatching. With no `--model`, the reviewer model is the `model` of `.opencode/agents/phase-reviewer.md` and the dispatch passes none. Every round uses the same reviewer model and marker; from round 2 read them from the previous report's header.
+**The model.** `--model <m>` is accepted only when `<m>` is in the reviewer list of `AGENTS.md` ("Roles and models") and matches `^[a-z0-9-]+/[A-Za-z0-9._-]+(#[A-Za-z0-9._-]+)?$`. A value that is not in the reviewer list, or that does not match that regex, or is given twice, or without a value, or as any other token, is a stop: print the offending value and end with nothing else. Do not run a precondition, write a file, or dispatch. (`openai/gpt-x` is a stop: not in the list. A value containing a space or `;` is a stop: it fails the regex.) With no `--model`, the reviewer model is the `model` of `.opencode/agents/phase-reviewer.md` and the dispatch passes none. Every round uses the same reviewer model and marker; from round 2 read them from the previous report's header.
 
-**The author.** The distinct `builder model:` values of the ledger's `Phase <n> confirmed:` lines, joined by `,`; `unknown` when there are none; this session's own model for `--no-phase`. The script adds every model a `Co-Authored-By` trailer of the range credits.
+**The author.** The distinct `builder model:` values of the ledger's `Phase <n> confirmed:` lines, joined by `,`; `unknown` when there are none; the clerk's own model for `--no-phase`. The script adds every model a `Co-Authored-By` trailer of the range credits.
 
 **The brief.** Run the script as a command of its own, `<top>` written out, and use its output as the dispatch prompt, copied as printed:
 
@@ -102,7 +102,7 @@ bash <top>/scripts/review-brief.sh --phase <plan path> <phase> --reviewer <model
 bash <top>/scripts/review-brief.sh --no-phase "<purpose>" --reviewer <model> --author <models> --checks <top>/.superpowers/review/<branch-dir>/checks.txt [--override]
 ```
 
-`--override` is passed only with `--model`. From round 2 on add `--changes <file>`: one line per previous finding, `<id>: <what changed>` (fixed, deferred with the reason, or ruled on by the owner). The script refuses to print a later round without it. Print the brief in this session before dispatching, so the owner sees what the reviewer got.
+`--override` is passed only with `--model`. From round 2 on add `--changes <file>`: one line per previous finding, `<id>: <what changed>` (fixed, deferred with the reason, or ruled on by the owner). The script refuses to print a later round without it. The clerk prints the brief before dispatching, so the owner sees what the reviewer got.
 
 ## 3 Dispatch
 
@@ -118,19 +118,19 @@ A report with no verdict line is malformed: rename it as above and dispatch the 
 
 ## 4 The loop
 
-Every fix, whether a Not-approved round asks for it or the owner approves one after an approval, is made by `phase-builder`, never by this session: resumed by its `sessionID` from the ledger when known, otherwise a fresh dispatch carrying the findings. It works test first when behaviour changes.
+Every fix, whether a Not-approved round asks for it or the owner approves one after an approval, is made by `phase-builder`, never by the clerk: resumed by its `sessionID` from the ledger when known, otherwise a fresh dispatch carrying the findings. It works test first when behaviour changes.
 
 On **Not approved**:
 
 - Fix every Must Fix.
 - Fix or defer each Should Fix. A deferral is written in the PR draft's Deferred findings with a reason.
 - List each Consider in the PR draft's Deferred findings.
-- After each fix the controller runs the three checks on the new head and rewrites `checks.txt`, and `task-reviewer` does a scoped re-review of the fix. Then write the changes file and dispatch the next round from step 2, on the new head.
+- After each fix the clerk runs the three checks on the new head and rewrites `checks.txt`, and `task-reviewer` does a scoped re-review of the fix. Then write the changes file and dispatch the next round from step 2, on the new head.
 - **At most 3 rounds.** After round 3, or any later round, with Must Fix findings open, they go to the owner, who decides another round or how they are settled. Append the decision to `rulings.md` as `- After round <n> (owner's decision): <decision> (<YYYY-MM-DD>)`.
 
 ## 5 Disputes
 
-A finding this session believes is wrong is neither fixed nor silently ignored. It goes to the owner with both readings, this session's recommendation first. Append the owner's ruling to `<top>/.superpowers/review/<branch-dir>/rulings.md` (create it if absent) as `- <finding id>: <ruling> (<YYYY-MM-DD>)`. The next brief names the file. A ruling that changes a spec updates the spec in `.superpowers/specs/` (git-ignored, never committed) and is recorded in the PR draft's Rulings. Only the owner rules on a dispute.
+A finding the clerk believes is wrong is neither fixed nor silently ignored. It goes to the owner with both readings, the clerk's recommendation first. Append the owner's ruling to `<top>/.superpowers/review/<branch-dir>/rulings.md` (create it if absent) as `- <finding id>: <ruling> (<YYYY-MM-DD>)`. The next brief names the file. A ruling that changes a spec updates the spec in `.superpowers/specs/` (git-ignored, never committed) and is recorded in the PR draft's Rulings. Only the owner rules on a dispute.
 
 ## 6 On approval
 
@@ -138,12 +138,12 @@ There is no stamp: the report's last line is the record.
 
 1. **The state held.** `git rev-parse HEAD` equals the brief's head and `git status --porcelain` prints nothing. Otherwise the approval is void: put the state back, or have `phase-builder` commit the change through [the loop](#4-the-loop) and run the next round.
 2. **The public-repo check, again on this head.** `git log --name-only --format= origin/main..HEAD` lists no path under `.superpowers/` or `docs/superpowers/`. Fix commits of later rounds are in this range too. A hit is a stop for the owner, and nothing is pushed.
-3. **Fill the PR draft's Code-review verdict:** the verdict, the reviewed head sha, the round count, the reviewer model and the report file name. Fill Verification with the checks of `checks.txt`.
-4. **Ask once.** Show the owner the branch, the sha and the PR body, and ask with the `question` tool: push the branch and open the PR as shown? A cancelled, unanswered or errored `question` is a stop. Nothing is pushed before an answer.
+3. **Fill the PR draft's Code-review verdict:** the verdict, the reviewed head sha, the round count, the reviewer model and the report file name. Add the checks of `checks.txt` to Verification, keeping what is already there.
+4. **Ask once.** Show the owner the branch, the sha and the PR body, and ask with the `question` tool: push the branch and open the PR as shown? Only an explicit **yes** pushes. Any other answer — no, cancelled, unanswered, an error, or a non-interactive "continue without an answer" — is a stop, and nothing is pushed.
 5. **Push and open.** `git push -u origin HEAD`, then `gh pr create -R jcalderonzumba/opencode-cursor-v2 --base main --head <branch> --title "<plain words>" --body-file <top>/.superpowers/review/<branch-dir>/pr-body.md`. A refusal is a stop for the owner.
 6. **Verify the head.** `gh pr view <n> -R jcalderonzumba/opencode-cursor-v2 --json headRefOid` must equal the reviewed sha; otherwise stop and tell the owner.
 7. **The DONE marker, last.** For a plan phase only (not `--no-phase`), append ` — ✅ DONE (PR #<n>)` to the phase's `## Phase <n>` heading in the plan. A step that failed before the PR opened leaves no marker.
 
 ## 7 Landing
 
-The owner's word "land pr" starts it; this session never lands on its own. Load the `land-pr` skill and merge with `gh pr merge <n> -R jcalderonzumba/opencode-cursor-v2 --squash --match-head-commit <reviewed sha> --delete-branch`. Then sync the local `main` (`git switch main`, `git pull --ff-only`) and delete the local branch.
+The owner's word "land pr" starts it; the clerk never lands on its own. Load the `land-pr` skill and merge with `gh pr merge <n> -R jcalderonzumba/opencode-cursor-v2 --squash --match-head-commit <reviewed sha> --delete-branch`. Then sync the local `main` (`git switch main`, `git pull --ff-only`) and delete the local branch.

@@ -125,6 +125,10 @@ touch "$REVIEW/round-1.md"
 refused "round 2 without changes is refused" "--changes" --phase "$PLAN" 4 "${STD[@]}"
 
 new_repo
+touch "$REVIEW/round-1.md"
+refused "changes that is a directory is refused" "--changes" --phase "$PLAN" 4 "${STD[@]}" --changes "$TMP"
+
+new_repo
 touch "$REVIEW/round-1.malformed-1.md"
 passes "renamed malformed report does not count" --phase "$PLAN" 4 "${STD[@]}"
 has "- **Round:** 1"

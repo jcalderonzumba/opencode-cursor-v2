@@ -99,7 +99,7 @@ round=$((last + 1))
 
 if ((round > 1)); then
   [[ -n $changes ]] || die "round $round needs --changes <file>: one line per previous finding, '<id>: <what changed>'"
-  [[ -s $changes ]] || die "the --changes file is missing or empty: $changes"
+  [[ -f $changes && -s $changes ]] || die "the --changes file is missing or empty: $changes"
 fi
 
 # Two models are the same when their keys match: lowercase, up to the last `/` removed, `.` as `-`.
