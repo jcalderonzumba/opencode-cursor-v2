@@ -2397,12 +2397,9 @@ function buildCursorRequest(
     ? settlePendingToolCalls(baseState.pendingToolCalls, toolResults ?? [])
     : [];
   const conversationState = baseState ? create(ConversationStateStructureSchema, { ...baseState, rootPromptMessagesJson, turns: turnBlobIds, pendingToolCalls }) : create(ConversationStateStructureSchema, { rootPromptMessagesJson, turns: turnBlobIds, todos: [], pendingToolCalls: [], previousWorkspaceUris: [], fileStates: {}, fileStatesV2: {}, summaryArchives: [], turnTimings: [], subagentStates: {}, selfSummaryCount: 0, readPaths: [] });
-  const hasToolResults = toolResults && toolResults.length > 0;
-  const action = hasToolResults
-    ? create(ConversationActionSchema, { action: { case: "resumeAction" as const, value: create(ResumeActionSchema, {}) } })
-    : userText
-      ? create(ConversationActionSchema, { action: { case: "userMessageAction" as const, value: create(UserMessageActionSchema, { userMessage: create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() }) }) } })
-      : create(ConversationActionSchema, { action: { case: "resumeAction" as const, value: create(ResumeActionSchema, {}) } });
+  const action = userText
+    ? create(ConversationActionSchema, { action: { case: "userMessageAction" as const, value: create(UserMessageActionSchema, { userMessage: create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() }) }) } })
+    : create(ConversationActionSchema, { action: { case: "resumeAction" as const, value: create(ResumeActionSchema, {}) } });
   const cursorModelId = modelId === "auto" ? "default" : modelId;
   const displayName = modelId === "auto" ? "Auto" : modelId;
   const requestedModel = create(RequestedModelSchema, { modelId: cursorModelId });

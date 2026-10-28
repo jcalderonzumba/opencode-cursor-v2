@@ -7,6 +7,7 @@ import net, { type AddressInfo } from "node:net";
 import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
+  type AgentClientMessage,
   AgentServerMessageSchema,
   BidiRequestIdSchema,
   ClientHeartbeatSchema,
@@ -59,6 +60,8 @@ interface TestCursorBackend {
   setHttp1Fault: (fault: "read-error" | "bidi-error" | undefined) => void;
   /** One `h1 <path>` / `h2 <path>` entry per request that reached the backend. */
   getRequests: () => string[];
+  /** Every `runRequest` the proxy sent, over either transport, in arrival order. */
+  getRunRequests: () => Array<AgentClientMessage["message"] & { case: "runRequest" }>;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
@@ -179,6 +182,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const requests: string[] = [];
   let allowedTransport: "both" | "h1" | "h2" = "both";
   let http1Fault: "read-error" | "bidi-error" | undefined;
+  const runRequests: Array<AgentClientMessage["message"] & { case: "runRequest" }> = [];
+  const recordRunRequest = (bytes: Uint8Array) => {
+    const message = fromBinary(AgentClientMessageSchema, bytes).message;
+    if (message.case === "runRequest") runRequests.push(message);
+  };
 
   const discoveryProto = () =>
     toBinary(
@@ -270,8 +278,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           res.end();
           return;
         }
-        res.writeHead(200, { "Content-Type": "application/proto" });
-        res.end();
+        const body = Buffer.concat(chunks);
+        void import("../src/proxy").then(({ decodeBidiAppendRequest }) => {
+          recordRunRequest(Buffer.from(decodeBidiAppendRequest(body).dataHex, "hex"));
+          res.writeHead(200, { "Content-Type": "application/proto" });
+          res.end();
+        });
         return;
       }
       res.writeHead(404);
@@ -293,6 +305,16 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       stream.on("close", () => {
         heldRunStreams.delete(stream);
         closed.resolve();
+      });
+      let framed = Buffer.alloc(0);
+      stream.on("data", (chunk) => {
+        framed = Buffer.concat([framed, Buffer.from(chunk)]);
+        while (framed.length >= 5) {
+          const len = framed.readUInt32BE(1);
+          if (framed.length < 5 + len) break;
+          recordRunRequest(framed.subarray(5, 5 + len));
+          framed = framed.subarray(5 + len);
+        }
       });
       if (holdRunStream) {
         // Cancellation can only be observed on a stream still running when the
@@ -415,8 +437,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     getRequests() {
       return [...requests];
     },
+    getRunRequests() {
+      return [...runRequests];
+    },
     resetObservations() {
       requests.length = 0;
+      runRequests.length = 0;
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
@@ -1281,6 +1307,84 @@ async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Array content parsing OK");
 }
 
+/** What Cursor is asked to do depends on the trailing message, not on tool results earlier in the history. */
+async function testRunActionAfterToolHistory(modules: TestModules, backend: TestCursorBackend) {
+  console.log("[test] Testing the run action chosen after tool-using turns...");
+  const toolCall = {
+    id: "call_1",
+    type: "function",
+    function: { name: "read", arguments: "{}" },
+  };
+  const cases: Array<{
+    name: string;
+    messages: unknown[];
+    action: string;
+    text: string;
+  }> = [
+    {
+      name: "plain user turn",
+      messages: [
+        { role: "system", content: "sys plain" },
+        { role: "user", content: "first question" },
+      ],
+      action: "userMessageAction",
+      text: "first question",
+    },
+    {
+      name: "new user turn after a tool-using turn",
+      messages: [
+        { role: "system", content: "sys after tools" },
+        { role: "user", content: "first q" },
+        { role: "assistant", content: null, tool_calls: [toolCall] },
+        { role: "tool", tool_call_id: "call_1", content: "file contents" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "SECOND QUESTION" },
+      ],
+      action: "userMessageAction",
+      text: "SECOND QUESTION",
+    },
+    {
+      name: "trailing tool result",
+      messages: [
+        { role: "system", content: "sys trailing tool" },
+        { role: "user", content: "first q" },
+        { role: "assistant", content: null, tool_calls: [toolCall] },
+        { role: "tool", tool_call_id: "call_1", content: "file contents" },
+      ],
+      action: "resumeAction",
+      text: "",
+    },
+  ];
+
+  for (const http1 of [false, true]) {
+    for (const testCase of cases) {
+      const label = `${http1 ? "HTTP/1.1" : "HTTP/2"}, ${testCase.name}`;
+      backend.resetObservations();
+      try {
+        const port = await modules.startProxy(async () => "test-token", [], http1);
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "composer-2",
+            stream: true,
+            messages: testCase.messages,
+          }),
+        });
+        await res.text();
+        await waitFor(() => backend.getRunRequests().length > 0, `a run request (${label})`);
+        const action = backend.getRunRequests()[0]!.value.action?.action;
+        assertEqual(action?.case, testCase.action, `Run action (${label})`);
+        const text = action?.case === "userMessageAction" ? action.value.userMessage?.text : "";
+        assertEqual(text, testCase.text, `Run action text (${label})`);
+      } finally {
+        modules.stopProxy();
+      }
+    }
+  }
+  console.log("[test] Run action after tool history OK");
+}
+
 async function testExpiredTokenRefreshBeforeDiscovery(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -1709,6 +1813,7 @@ async function main() {
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testArrayContentParsing(modules);
+    await testRunActionAfterToolHistory(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testV2Plugin(modules, backend);
