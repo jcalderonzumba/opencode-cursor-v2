@@ -131,7 +131,7 @@ export function redirectNativeExec(
 
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
-    const toolName = pick(["shell", "bash"]);
+    const toolName = pick(["shell"]);
     if (!toolName) return null;
     const decodedArgs: Record<string, unknown> = {
       command: args.command ?? "",

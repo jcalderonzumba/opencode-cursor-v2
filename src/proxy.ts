@@ -1247,7 +1247,7 @@ function redirectUnknownTool(
     return emit(pickTool(mcpTools, ["read"]), decoded);
   }
   if (fieldNo === 46) {
-    return emit(pickTool(mcpTools, ["shell", "bash"]), { command: fieldString(fields, 1) });
+    return emit(pickTool(mcpTools, ["shell"]), { command: fieldString(fields, 1) });
   }
   if (fieldNo === 47) {
     const edit = fields.find((field) => field.no === 2 && field.wire === WIRE_LEN);
@@ -2323,15 +2323,13 @@ function toolCallIdParts(id: string): string[] {
   return id.split(/[\s\n]+/).map((part) => part.trim()).filter(Boolean);
 }
 
-/** OpenCode rewrites ids (`<callId>-2\n<fcId>_2`); a part of one id matches the other id with or without that suffix. */
+/** OpenCode rewrites ids (`<callId>-2\n<fcId>_2`); a part of one id matches the other id with or without a numeric `-n`/`_n` suffix. */
 function toolCallIdsMatch(a: string, b: string): boolean {
   if (a === b) return true;
   const aParts = toolCallIdParts(a);
   const bParts = toolCallIdParts(b);
   const matches = (long: string, short: string) =>
-    long === short ||
-    long.startsWith(`${short}-`) ||
-    long.startsWith(`${short}_`);
+    long === short || (long.startsWith(short) && /^[-_]\d+$/.test(long.slice(short.length)));
   return aParts.some((aPart) => bParts.some((bPart) => matches(aPart, bPart) || matches(bPart, aPart)));
 }
 
@@ -2340,8 +2338,7 @@ export function settlePendingToolCalls(
   toolResults: readonly { toolCallId: string }[],
 ): string[] {
   if (pending.length === 0 || toolResults.length === 0) return [...pending];
-  const settledIds = new Set(toolResults.flatMap((result) => toolCallIdParts(result.toolCallId)));
-  const isSettled = (toolCallId: string) => toolCallIdParts(toolCallId).some((part) => settledIds.has(part));
+  const isSettled = (toolCallId: string) => toolResults.some((result) => toolCallIdsMatch(result.toolCallId, toolCallId));
   const next: string[] = [];
   for (const raw of pending) {
     let parsed: {
