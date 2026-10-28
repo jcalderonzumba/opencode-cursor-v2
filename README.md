@@ -3,17 +3,22 @@
 OpenCode plugin that connects to Cursor's API, giving you access to Cursor
 models inside OpenCode with full tool-calling support.
 
-## OpenCode V2 beta
+## OpenCode V2
+
+This plugin targets OpenCode V2 only. It was verified against OpenCode 2.1.4:
+the plugin loads and registers the `cursor` integration and its OAuth method.
+Model discovery and chat need a real Cursor login, which that check did not
+cover.
 
 Install the plugin:
 
 ```sh
-opencode2 plugin add opencode-cursor-oauth
+opencode plugin add opencode-cursor-oauth
 ```
 
 The command adds the package to your global V2 configuration.
 
-Start `opencode2`.
+Start `opencode`.
 Run `/connect`.
 Select Cursor.
 
@@ -30,33 +35,14 @@ You can also add the package directly to `opencode.jsonc`:
 }
 ```
 
-## OpenCode V1
-
-Add the package to `~/.config/opencode/opencode.json`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "opencode-cursor-oauth"
-  ]
-}
-```
-
-Connect Cursor:
-
-```sh
-opencode auth login --provider cursor
-```
-
-OpenCode V1 and OpenCode V2 add the `cursor` provider and its models.
 OpenCode installs npm plugins during startup.
 You do not have to clone this repository.
 
 ## Use
 
-Start OpenCode and select any Cursor model. The plugin starts a local
-OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
+Start OpenCode and select any Cursor model. Once a Cursor login exists, the
+plugin starts a local OpenAI-compatible proxy and routes requests through
+Cursor's gRPC API.
 
 ## How it works
 
@@ -70,6 +56,52 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 
 HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
 Bun's `node:http2` support is not reliable against Cursor's API.
+
+### HTTP/1.1 fallback
+
+HTTP/2 stays the default. Use the HTTP/1.1 transport when the H2 bridge cannot
+connect, for example behind corporate proxies that block HTTP/2. Set the
+`disableHttp2` plugin option in the `plugins` array of `opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-cursor-oauth",
+      "options": { "disableHttp2": true }
+    }
+  ]
+}
+```
+
+`CURSOR_DISABLE_HTTP2=1` does the same when the option is omitted. An explicit
+`true` or `false` option wins over the environment variable; a value that is
+not a boolean is ignored. Model discovery and agent turns use the same
+transport.
+
+The HTTP/1.1 transport has only been tested against a fake backend, not a real
+blocking proxy.
+
+Unary RPCs such as model discovery are a plain HTTP/1.1 `POST` with
+`Content-Type: application/proto` and the raw protobuf body.
+
+Agent turns use Cursor's HTTP/1.1 fallback and do stream:
+
+- `POST /agent.v1.AgentService/RunSSE` with `Content-Type: application/connect+proto`,
+  header `x-cursor-streaming: true`, and one Connect envelope whose payload is
+  `BidiRequestId` (the same id as `x-request-id`).
+- The run request and every later client message (tool results, KV replies,
+  heartbeats) go to `POST /aiserver.v1.BidiService/BidiAppend`. The `data`
+  field is the hex encoding of an `AgentClientMessage`, and `request_id`
+  matches the `RunSSE` `x-request-id`. `append_seqno` starts at 0 for the run
+  request and increases by one for each message.
+
+The response is a stream of Connect envelopes. Cursor labels this response
+`text/event-stream`, but the bytes are still envelopes, not `data:` events.
+The proxy reads them as they arrive and emits OpenAI SSE chunks. A final
+envelope with flag `0x02` ends the stream. While the turn is open the proxy
+sends a client heartbeat on `BidiAppend` every 5 seconds.
 
 ## Architecture
 
@@ -103,7 +135,8 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 
 Conversation history is rebuilt from the OpenAI messages on every request
 (`rootPromptMessagesJson` + content-addressed turn blobs), and server
-checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
+checkpoints are persisted to `~/.cache/opencode-cursor/conversations/`
+(`$XDG_CACHE_HOME/opencode-cursor/conversations/` when set) so
 context survives restarts. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
 handshake and exec traffic when debugging.
 
@@ -115,9 +148,11 @@ bun run build
 bun test/smoke.ts
 ```
 
+`@opencode/plugin` is only a devDependency (types and the smoke test): the OpenCode host provides it to plugins at runtime.
+
 ## Requirements
 
-- [OpenCode](https://opencode.ai)
+- [OpenCode](https://opencode.ai) V2 (2.1.4 verified)
 - [Bun](https://bun.sh)
 - [Node.js](https://nodejs.org) >= 18 for the HTTP/2 bridge process
 - Active [Cursor](https://cursor.com) subscription

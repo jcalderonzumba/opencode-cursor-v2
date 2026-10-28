@@ -1,4 +1,10 @@
-import { Credential, Integration, Model, Plugin } from "@opencode-ai/plugin";
+import {
+  Credential,
+  Integration,
+  Model,
+  Plugin,
+  Provider,
+} from "@opencode/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -10,28 +16,35 @@ import {
   getCursorModels,
   type CursorModel,
 } from "./models";
-import { startProxy, stopProxy } from "./proxy";
+import { CURSOR_DISABLE_HTTP2, startProxy, stopProxy } from "./proxy";
 
 const CURSOR_ID = "cursor";
-const CURSOR_INTEGRATION_ID = Integration.ID.make(CURSOR_ID);
-const CURSOR_METHOD_ID = Integration.MethodID.make("cursor-oauth");
+const CURSOR_METHOD_ID = "cursor-oauth" as Integration.MethodID;
 const OPENAI_COMPATIBLE_PACKAGE =
-  "@opencode-ai/ai/providers/openai-compatible";
+  "@opencode/ai/providers/openai-compatible";
 
 interface CatalogState {
   readonly models: CursorModel[];
   readonly port: number;
 }
 
+/** Provider.Info is a frozen-by-default schema struct; these drafts are built fresh. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
 const CursorV2Plugin = Plugin.define({
   id: "opencode.cursor-oauth",
   setup: async (ctx) => {
+    // The plugin option wins when it is a boolean; otherwise the env var decides.
+    const disableHttp2 =
+      typeof ctx.options.disableHttp2 === "boolean"
+        ? ctx.options.disableHttp2
+        : CURSOR_DISABLE_HTTP2;
     await ctx.integration.transform((draft) => {
       draft.update(CURSOR_ID, (integration) => {
         integration.name = "Cursor";
       });
       draft.method.update({
-        integrationID: CURSOR_INTEGRATION_ID,
+        integrationID: CURSOR_ID,
         method: {
           id: CURSOR_METHOD_ID,
           type: "oauth",
@@ -71,46 +84,48 @@ const CursorV2Plugin = Plugin.define({
     // Setup batches transforms, so apply OAuth refresh before loading the catalog.
     await ctx.integration.reload();
 
-    let catalog = await loadCatalog(ctx);
-    await ctx.catalog.transform((draft) => {
+    let catalog = await loadCatalog(ctx, disableHttp2);
+    await ctx.provider.transform((draft) => {
       const current = catalog;
       if (!current) return;
 
-      draft.provider.update(CURSOR_ID, (provider) => {
-        provider.integrationID = CURSOR_INTEGRATION_ID;
-        provider.name = "Cursor";
-        provider.activation = "auto";
-        provider.package = OPENAI_COMPATIBLE_PACKAGE;
-        provider.settings = {
-          ...provider.settings,
-          baseURL: `http://localhost:${current.port}/v1`,
+      const info = Provider.Info.empty(CURSOR_ID as Provider.ID) as Mutable<Provider.Info>;
+      info.integrationID = CURSOR_ID as Integration.ID;
+      info.name = "Cursor";
+      info.activation = "auto";
+      info.package = OPENAI_COMPATIBLE_PACKAGE;
+      info.settings = {
+        baseURL: `http://127.0.0.1:${current.port}/v1`,
+      };
+
+      const models = current.models.map((cursorModel) => {
+        const model = Model.Info.default(
+          CURSOR_ID as Provider.ID,
+          cursorModel.id as Model.ID,
+        ) as Mutable<Model.Info>;
+        model.name = cursorModel.name;
+        model.capabilities = {
+          tools: true,
+          input: ["text"],
+          output: ["text"],
         };
+        model.limit = {
+          context: cursorModel.contextWindow,
+          output: cursorModel.maxTokens,
+        };
+        return model;
       });
 
-      for (const cursorModel of current.models) {
-        draft.model.update(CURSOR_ID, cursorModel.id, (model) => {
-          model.modelID = Model.ID.make(cursorModel.id);
-          model.name = cursorModel.name;
-          model.capabilities = {
-            tools: true,
-            input: ["text"],
-            output: ["text"],
-          };
-          model.limit = {
-            context: cursorModel.contextWindow,
-            output: cursorModel.maxTokens,
-          };
-          model.status = "active";
-          model.enabled = true;
-        });
-      }
+      draft.add({ info, models });
     });
+    // Ensure the freshly registered provider transform is applied immediately.
+    await ctx.provider.reload();
 
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
-      catalog = await loadCatalog(ctx);
+      catalog = await loadCatalog(ctx, disableHttp2);
       if (!catalog) stopProxy();
-      await ctx.catalog.reload();
+      await ctx.provider.reload();
     });
 
     return async () => {
@@ -127,11 +142,12 @@ export default CursorV2Plugin;
 
 async function loadCatalog(
   ctx: Plugin.Context,
+  disableHttp2: boolean,
 ): Promise<CatalogState | undefined> {
   try {
     const accessToken = await getAccessToken(ctx);
-    const models = await getCursorModels(accessToken);
-    const port = await startProxy(() => getAccessToken(ctx), models);
+    const models = await getCursorModels(accessToken, disableHttp2);
+    const port = await startProxy(() => getAccessToken(ctx), models, disableHttp2);
     return { models, port };
   } catch {
     return undefined;
@@ -161,8 +177,9 @@ function watchConnections(
         if (next.done) return;
         const event = next.value;
         if (
-          event.type === "integration.connection.updated" &&
-          event.data.integrationID === CURSOR_ID
+          event.type === "credential.updated" ||
+          (event.type === "credential.switched" &&
+            event.data?.integrationID === CURSOR_ID)
         ) {
           await refresh().catch(() => {});
         }
