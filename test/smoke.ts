@@ -37,6 +37,7 @@ interface TestModules {
   refreshCursorToken: typeof import("../src/auth").refreshCursorToken;
   CursorV2Plugin: typeof CursorV2PluginModule;
   setHttp1PausedStreamMaxMsForTesting: typeof import("../src/proxy").setHttp1PausedStreamMaxMsForTesting;
+  setStreamStallMaxMsForTesting: typeof import("../src/proxy").setStreamStallMaxMsForTesting;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
 }
@@ -59,6 +60,8 @@ interface TestCursorBackend {
   setHoldRunStream: (hold: boolean) => void;
   /** While holding, also emit an MCP tool call with this id; the stream answers the tool result and ends. */
   setRunStreamToolCall: (toolCallId: string | undefined) => void;
+  /** While holding, emit a reasoning delta on this interval. `0` stops it. */
+  setRunStreamDripMs: (ms: number) => void;
   /** While holding, also emit this native exec request (id 1, exec id `exec-1`). HTTP/2 only: the HTTP/1 held path ignores it. */
   setRunStreamExec: (message: ExecServerMessage["message"] | undefined) => void;
   getOpenRunStreamCount: () => number;
@@ -171,6 +174,23 @@ function frameRunExec(message: ExecServerMessage["message"]): Buffer {
   );
 }
 
+/** A Connect-framed reasoning delta. Server data, so it must keep an active turn alive. */
+function frameRunThinkingDelta(text: string): Buffer {
+  return frameConnectUnaryMessage(
+    toBinary(
+      AgentServerMessageSchema,
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "interactionUpdate",
+          value: create(InteractionUpdateSchema, {
+            message: { case: "thinkingDelta", value: { text } },
+          }),
+        },
+      }),
+    ),
+  );
+}
+
 /** A Connect-framed MCP tool call, which makes the proxy pause the stream for a tool result. */
 function frameRunToolCall(toolCallId: string): Buffer {
   return frameRunExec({
@@ -191,6 +211,25 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const heldHttp1Responses = new Set<http.ServerResponse>();
   let holdRunStream = false;
   let runStreamToolCallId: string | undefined;
+  let runStreamDripMs = 0;
+  const dripTimers = new Set<ReturnType<typeof setInterval>>();
+  const startDrip = (
+    write: (chunk: Buffer) => void,
+    ended: () => boolean,
+    onClose: (cb: () => void) => void,
+  ) => {
+    if (runStreamDripMs <= 0) return;
+    const timer = setInterval(() => {
+      if (ended()) return;
+      write(frameRunThinkingDelta("still thinking"));
+    }, runStreamDripMs);
+    dripTimers.add(timer);
+    const stop = () => {
+      clearInterval(timer);
+      dripTimers.delete(timer);
+    };
+    onClose(stop);
+  };
   const refreshAuthHeaders: string[] = [];
   const requests: string[] = [];
   let allowedTransport: "both" | "h1" | "h2" = "both";
@@ -284,6 +323,13 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           });
           res.write(frameRunTextDelta("streaming"));
           if (runStreamToolCallId) res.write(frameRunToolCall(runStreamToolCallId));
+          startDrip(
+            (chunk) => {
+              if (!res.writableEnded && !res.destroyed) res.write(chunk);
+            },
+            () => res.writableEnded || res.destroyed,
+            (cb) => res.on("close", cb),
+          );
           return;
         }
         res.end(frameRunTextDelta("from-http1"));
@@ -339,6 +385,13 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         // first body byte, so emit one to unblock the caller's fetch.
         heldRunStreams.add(stream);
         stream.write(frameRunTextDelta("streaming"));
+        startDrip(
+          (chunk) => {
+            if (!stream.closed && !stream.destroyed) stream.write(chunk);
+          },
+          () => stream.closed || stream.destroyed,
+          (cb) => stream.on("close", cb),
+        );
         if (runStreamExec) stream.write(frameRunExec(runStreamExec));
         if (runStreamToolCallId) {
           stream.write(frameRunToolCall(runStreamToolCallId));
@@ -449,6 +502,13 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     setRunStreamToolCall(toolCallId) {
       runStreamToolCallId = toolCallId;
     },
+    setRunStreamDripMs(ms) {
+      runStreamDripMs = ms;
+      if (ms <= 0) {
+        for (const timer of dripTimers) clearInterval(timer);
+        dripTimers.clear();
+      }
+    },
     setRunStreamExec(message) {
       runStreamExec = message;
     },
@@ -524,6 +584,7 @@ async function loadModules(): Promise<TestModules> {
     refreshCursorToken: auth.refreshCursorToken,
     CursorV2Plugin: v2.default,
     setHttp1PausedStreamMaxMsForTesting: proxy.setHttp1PausedStreamMaxMsForTesting,
+    setStreamStallMaxMsForTesting: proxy.setStreamStallMaxMsForTesting,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
@@ -830,6 +891,140 @@ async function testHttp1PausedStreamIsCapped(
     modules.setHttp1PausedStreamMaxMsForTesting();
   }
   console.log("[test] HTTP/1.1 paused stream cap OK");
+}
+
+/**
+ * Fails if a silent active stream stays open, ends without a stall error and
+ * [DONE], or leaves the upstream (the HTTP/2 bridge subprocess, or the
+ * HTTP/1.1 RunSSE stream) running.
+ */
+async function testSilentStreamEndsWithError(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing a silent stream ends with a stall error...");
+  const limitMs = 500;
+  for (const disableHttp2 of [false, true] as const) {
+    const label = disableHttp2 ? "HTTP/1.1" : "HTTP/2";
+    modules.setStreamStallMaxMsForTesting(limitMs);
+    backend.resetObservations();
+    backend.setHoldRunStream(true);
+    const controller = new AbortController();
+    try {
+      const port = await modules.startProxy(async () => "test-token", [], disableHttp2);
+      const res = await postChat(port, [{ role: "user", content: `silent ${label}` }], controller.signal);
+      assertEqual(res.status, 200, `${label}: expected a streaming response`);
+      const body = await withTimeout(readUntilDone(res), `${label}: the silent stream to end`, 5_000);
+      assert(body.includes("streaming"), `${label}: expected the stream to start, got ${body}`);
+      assert(
+        body.includes("[Error: Cursor stream stalled]"),
+        `${label}: expected a stall error, got ${body}`,
+      );
+      assert(body.includes("data: [DONE]"), `${label}: expected [DONE], got ${body}`);
+      await waitFor(
+        () => backend.getOpenRunStreamCount() === 0,
+        `${label}: the upstream stream to close after the stall`,
+      );
+    } finally {
+      controller.abort();
+      modules.stopProxy();
+      backend.setHoldRunStream(false);
+      modules.setStreamStallMaxMsForTesting();
+    }
+  }
+  console.log("[test] Silent stream stall OK");
+}
+
+/**
+ * Fails if server data, including reasoning, does not reset the stall limit.
+ */
+async function testSlowStreamIsNotCutOff(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing a slow stream that keeps emitting is not cut off...");
+  const limitMs = 500;
+  const dripMs = 150;
+  for (const disableHttp2 of [false, true] as const) {
+    const label = disableHttp2 ? "HTTP/1.1" : "HTTP/2";
+    modules.setStreamStallMaxMsForTesting(limitMs);
+    backend.resetObservations();
+    backend.setHoldRunStream(true);
+    backend.setRunStreamDripMs(dripMs);
+    const controller = new AbortController();
+    try {
+      const port = await modules.startProxy(async () => "test-token", [], disableHttp2);
+      const res = await postChat(port, [{ role: "user", content: `slow ${label}` }], controller.signal);
+      assertEqual(res.status, 200, `${label}: expected a streaming response`);
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let text = "";
+      const deadline = Date.now() + limitMs * 3;
+      while (Date.now() < deadline) {
+        const { done, value } = await withTimeout(reader.read(), `${label}: a stream chunk`, 2_000);
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+      assert(
+        text.includes("reasoning_content") && text.includes("still thinking"),
+        `${label}: expected reasoning to keep the stream alive, got ${text}`,
+      );
+      assert(!text.includes("[Error:"), `${label}: a live stream must not be stalled, got ${text}`);
+      assert(!text.includes("[DONE]"), `${label}: a live stream must stay open, got ${text}`);
+      assertEqual(backend.getOpenRunStreamCount(), 1, `${label}: upstream must stay open while data flows`);
+    } finally {
+      controller.abort();
+      modules.stopProxy();
+      backend.setHoldRunStream(false);
+      backend.setRunStreamDripMs(0);
+      modules.setStreamStallMaxMsForTesting();
+    }
+  }
+  console.log("[test] Slow stream OK");
+}
+
+/**
+ * Fails if the stall limit tears down a bridge that is waiting on a tool result.
+ */
+async function testPausedStreamIgnoresStall(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing a tool-paused stream is exempt from the stall limit...");
+  const limitMs = 500;
+  for (const disableHttp2 of [false, true] as const) {
+    const label = disableHttp2 ? "HTTP/1.1" : "HTTP/2";
+    const toolCallId = disableHttp2 ? "call-stall-exempt-h1" : "call-stall-exempt-h2";
+    modules.setStreamStallMaxMsForTesting(limitMs);
+    backend.resetObservations();
+    backend.setHoldRunStream(true);
+    backend.setRunStreamToolCall(toolCallId);
+    const controller = new AbortController();
+    try {
+      const port = await modules.startProxy(async () => "test-token", [], disableHttp2);
+      const res = await postChat(port, toolCallMessages(toolCallId, false), controller.signal);
+      const body = await withTimeout(readUntilDone(res), `${label}: the tool call to finish the SSE`);
+      assert(body.includes(toolCallId), `${label}: expected the tool call, got ${body}`);
+      assert(!body.includes("[Error: Cursor stream stalled]"), `${label}: pause must not be a stall, got ${body}`);
+      await waitFor(
+        () => backend.getOpenRunStreamCount() === 1,
+        `${label}: the paused upstream stream to stay open`,
+      );
+      await Bun.sleep(limitMs * 2);
+      assertEqual(
+        backend.getOpenRunStreamCount(),
+        1,
+        `${label}: a tool pause must survive the stall limit`,
+      );
+    } finally {
+      controller.abort();
+      modules.stopProxy();
+      backend.setHoldRunStream(false);
+      backend.setRunStreamToolCall(undefined);
+      modules.setStreamStallMaxMsForTesting();
+    }
+  }
+  console.log("[test] Tool pause exempt from stall OK");
 }
 
 async function waitFor(condition: () => boolean, message: string) {
@@ -2187,6 +2382,9 @@ async function main() {
     await run(testHttp1StreamCancellationAndStop, modules, backend);
     await run(testHttp1NonStreamingSurfacesUpstreamErrors, modules, backend);
     await run(testHttp1PausedStreamIsCapped, modules, backend);
+    await run(testSilentStreamEndsWithError, modules, backend);
+    await run(testSlowStreamIsNotCutOff, modules, backend);
+    await run(testPausedStreamIgnoresStall, modules, backend);
     await run(testCancelPausedBridgeKeepsBridge, modules, backend);
     await run(testPausedBridgeAcceptsCompoundToolCallId, modules, backend);
     await run(testNativeToolRedirectsTargetV2Tools);

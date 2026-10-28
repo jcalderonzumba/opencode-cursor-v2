@@ -345,6 +345,52 @@ export function setHttp1PausedStreamMaxMsForTesting(ms = HTTP1_PAUSED_STREAM_MAX
   http1PausedStreamMaxMs = ms;
 }
 
+// An active turn with no server bytes for this long is stalled. Client
+// heartbeats do not count, and a pause for a tool result is exempt.
+const STREAM_STALL_MAX_MS = 120_000;
+let streamStallMaxMs = STREAM_STALL_MAX_MS;
+
+/** Test hook: shorten the active-stream stall limit. Call without an argument to restore it. */
+export function setStreamStallMaxMsForTesting(ms = STREAM_STALL_MAX_MS): void {
+  streamStallMaxMs = ms;
+}
+
+/** Idle timer over server bytes only. `stop` exempts a tool-result pause. */
+function createStreamStallWatch(onStall: () => void): { touch: () => void; stop: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  let generation = 0;
+  return {
+    stop() {
+      stopped = true;
+      generation += 1;
+      clearTimeout(timer);
+    },
+    touch() {
+      clearTimeout(timer);
+      if (stopped) return;
+      const current = ++generation;
+      timer = setTimeout(() => {
+        if (stopped || current !== generation) return;
+        onStall();
+      }, streamStallMaxMs);
+      timer.unref?.();
+    },
+  };
+}
+
+function reportStalledStream(
+  sendSSE: (data: object) => void,
+  makeChunk: (delta: Record<string, unknown>, finishReason?: string | null) => object,
+  makeUsageChunk: () => object,
+  sendDone: () => void,
+): void {
+  sendSSE(makeChunk({ content: "\n[Error: Cursor stream stalled]" }));
+  sendSSE(makeChunk({}, "stop"));
+  sendSSE(makeUsageChunk());
+  sendDone();
+}
+
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 // Conversation state also persists to disk so context survives proxy/opencode
@@ -1787,8 +1833,10 @@ async function handleHttp1StreamingResponse(
       const abort = new AbortController();
       // Stops BidiAppend retries and the heartbeat, and aborts the RunSSE body.
       let pausedTimer: ReturnType<typeof setTimeout> | undefined;
+      let stopStallWatch = () => {};
       const teardown = () => {
         clearTimeout(pausedTimer);
+        stopStallWatch();
         http1.stop();
         abort.abort();
         activeHttp1Streams.delete(teardown);
@@ -1799,6 +1847,13 @@ async function handleHttp1StreamingResponse(
         closed = true;
         teardown();
       };
+      const stall = createStreamStallWatch(() => {
+        if (closed || mcpExecReceived) return;
+        reportStalledStream(sendSSE, makeChunk, makeUsageChunk, sendDone);
+        closeController();
+        teardown();
+      });
+      stopStallWatch = stall.stop;
 
       const processChunk = (messageBytes: Uint8Array) => {
         try {
@@ -1810,6 +1865,8 @@ async function handleHttp1StreamingResponse(
               else { const { content, reasoning } = tagFilter.process(text); if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning })); if (content) sendSSE(makeChunk({ content })); }
             },
             (exec) => {
+              // The turn is paused for a tool result, so silence is expected.
+              stall.stop();
               state.pendingExecs.push(exec); mcpExecReceived = true;
               const flushed = tagFilter.flush();
               if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1855,9 +1912,11 @@ async function handleHttp1StreamingResponse(
             handleEndStream,
           );
 
+          stall.touch();
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            if (value.byteLength > 0) stall.touch();
             parser.push(value);
           }
           if (channelError) throw channelError;
@@ -1914,7 +1973,9 @@ function createBridgeStreamResponse(
         if (closed) return;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       };
+      let stopStallWatch = () => {};
       const stopBridge = () => {
+        stopStallWatch();
         if (activeBridges.get(bridgeKey)?.bridge === bridge) {
           activeBridges.delete(bridgeKey);
         }
@@ -1963,6 +2024,13 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      const stall = createStreamStallWatch(() => {
+        if (closed || mcpExecReceived) return;
+        reportStalledStream(sendSSE, makeChunk, makeUsageChunk, sendDone);
+        closeController();
+        stopBridge();
+      });
+      stopStallWatch = stall.stop;
 
       const parser = createConnectFrameParser(
         (messageBytes) => {
@@ -1989,6 +2057,8 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                // Silence while OpenCode runs the tool is not a stalled turn.
+                stall.stop();
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
@@ -2058,9 +2128,13 @@ function createBridgeStreamResponse(
         },
       );
 
-      bridge.onData((chunk) => parser.push(chunk));
+      bridge.onData((chunk) => {
+        if (chunk.length > 0) stall.touch();
+        parser.push(chunk);
+      });
 
       bridge.onClose((code) => {
+        stall.stop();
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -2091,6 +2165,7 @@ function createBridgeStreamResponse(
           }
         }
       });
+      stall.touch();
     },
     cancel() {
       cancelStream?.();
