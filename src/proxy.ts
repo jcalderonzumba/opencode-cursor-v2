@@ -2440,17 +2440,20 @@ function parseMessages(messages: OpenAIMessage[]): { systemPrompts: string[]; us
   const systemPrompts = messages.filter((m) => m.role === "system").map((m) => textContent(m.content)).filter((text) => text.length > 0);
   const toolResults: { toolCallId: string; content: string }[] = [];
   const history: { kind: string; text: string }[] = [];
+  // Empty tool or assistant messages add no history entry, so the last entry alone cannot say whether the trailing message was a user turn.
+  let trailingUser = false;
   for (const msg of messages) {
     if (msg.role === "tool") {
+      trailingUser = false;
       const content = textContent(msg.content);
       toolResults.push({ toolCallId: msg.tool_call_id ?? "", content });
       if (content) history.push({ kind: "tool", text: content });
-    } else if (msg.role === "user") { history.push({ kind: "user", text: textContent(msg.content) }); }
-    else if (msg.role === "assistant") { const text = textContent(msg.content); if (text) history.push({ kind: "assistant", text }); }
+    } else if (msg.role === "user") { trailingUser = true; history.push({ kind: "user", text: textContent(msg.content) }); }
+    else if (msg.role === "assistant") { trailingUser = false; const text = textContent(msg.content); if (text) history.push({ kind: "assistant", text }); }
   }
   let userText = "";
   const last = history[history.length - 1];
-  if (last?.kind === "user") { userText = last.text; history.pop(); }
+  if (trailingUser && last?.kind === "user") { userText = last.text; history.pop(); }
   return { systemPrompts, userText, history, toolResults };
 }
 

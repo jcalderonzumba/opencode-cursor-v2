@@ -62,6 +62,8 @@ interface TestCursorBackend {
   getRequests: () => string[];
   /** Every `runRequest` the proxy sent, over either transport, in arrival order. */
   getRunRequests: () => Array<AgentClientMessage["message"] & { case: "runRequest" }>;
+  /** Decoded text of every successful MCP tool result the HTTP/2 run stream received. */
+  getMcpResultTexts: () => string[];
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
@@ -183,6 +185,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let allowedTransport: "both" | "h1" | "h2" = "both";
   let http1Fault: "read-error" | "bidi-error" | undefined;
   const runRequests: Array<AgentClientMessage["message"] & { case: "runRequest" }> = [];
+  const mcpResultTexts: string[] = [];
   const recordRunRequest = (bytes: Uint8Array) => {
     const message = fromBinary(AgentClientMessageSchema, bytes).message;
     if (message.case === "runRequest") runRequests.push(message);
@@ -335,6 +338,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
               const message = fromBinary(AgentClientMessageSchema, pending.subarray(5, 5 + len));
               pending = pending.subarray(5 + len);
               if (message.message.case === "execClientMessage") {
+                const exec = message.message.value.message;
+                if (exec.case === "mcpResult" && exec.value.result.case === "success") {
+                  for (const item of exec.value.result.value.content) {
+                    mcpResultTexts.push(item.content.case === "text" ? item.content.value.text : "");
+                  }
+                }
                 stream.write(frameRunTextDelta("after-tool"));
                 stream.end();
               }
@@ -440,9 +449,13 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     getRunRequests() {
       return [...runRequests];
     },
+    getMcpResultTexts() {
+      return [...mcpResultTexts];
+    },
     resetObservations() {
       requests.length = 0;
       runRequests.length = 0;
+      mcpResultTexts.length = 0;
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
@@ -828,7 +841,7 @@ async function readUntilDone(res: Response): Promise<string> {
   return text;
 }
 
-const toolCallMessages = (toolCallId: string, withResult: boolean) => [
+const toolCallMessages = (toolCallId: string, withResult: boolean, resultContent = "tool output") => [
   { role: "user", content: "run a tool" },
   ...(withResult
     ? [
@@ -837,7 +850,7 @@ const toolCallMessages = (toolCallId: string, withResult: boolean) => [
           content: "",
           tool_calls: [{ id: toolCallId, type: "function", function: { name: "echo", arguments: "{}" } }],
         },
-        { role: "tool", tool_call_id: toolCallId, content: "tool output" },
+        { role: "tool", tool_call_id: toolCallId, content: resultContent },
       ]
     : []),
 ];
@@ -862,10 +875,15 @@ async function testCancelPausedBridgeKeepsBridge(
     await new Promise((resolve) => setTimeout(resolve, 300));
     assertEqual(backend.getOpenRunStreamCount(), 1, "Paused bridge must survive the disconnect");
 
-    const resumed = await postChat(port, toolCallMessages("call-paused", true), second.signal);
+    const resumed = await postChat(port, toolCallMessages("call-paused", true, ""), second.signal);
     assertEqual(resumed.status, 200, "Expected the continuation to succeed");
     const body = await withTimeout(resumed.text(), "the continuation response to finish");
     assert(body.includes("after-tool"), `Expected the tool result to reach the same stream, got: ${body}`);
+    assertArrayEqual(
+      backend.getMcpResultTexts(),
+      [""],
+      "Empty tool result on paused bridge must not replay user message",
+    );
   } finally {
     first.abort();
     second.abort();
@@ -1346,6 +1364,7 @@ async function testRunActionAfterToolHistory(modules: TestModules, backend: Test
     messages: unknown[];
     action: string;
     text: string;
+    turns: number;
   }> = [
     {
       name: "plain user turn",
@@ -1355,6 +1374,7 @@ async function testRunActionAfterToolHistory(modules: TestModules, backend: Test
       ],
       action: "userMessageAction",
       text: "first question",
+      turns: 0,
     },
     {
       name: "new user turn after a tool-using turn",
@@ -1368,6 +1388,7 @@ async function testRunActionAfterToolHistory(modules: TestModules, backend: Test
       ],
       action: "userMessageAction",
       text: "SECOND QUESTION",
+      turns: 1,
     },
     {
       name: "trailing tool result",
@@ -1379,6 +1400,55 @@ async function testRunActionAfterToolHistory(modules: TestModules, backend: Test
       ],
       action: "resumeAction",
       text: "",
+      turns: 1,
+    },
+    {
+      name: "trailing empty tool result",
+      messages: [
+        { role: "system", content: "sys empty tool" },
+        { role: "user", content: "first q" },
+        { role: "assistant", content: null, tool_calls: [toolCall] },
+        { role: "tool", tool_call_id: "call_1", content: "" },
+      ],
+      action: "resumeAction",
+      text: "",
+      turns: 1,
+    },
+    {
+      name: "trailing tool result with empty array content",
+      messages: [
+        { role: "system", content: "sys empty array tool" },
+        { role: "user", content: "first q" },
+        { role: "assistant", content: null, tool_calls: [toolCall] },
+        { role: "tool", tool_call_id: "call_1", content: [] },
+      ],
+      action: "resumeAction",
+      text: "",
+      turns: 1,
+    },
+    {
+      name: "trailing assistant tool-call turn with null content",
+      messages: [
+        { role: "system", content: "sys trailing assistant" },
+        { role: "user", content: "first q" },
+        { role: "assistant", content: null, tool_calls: [toolCall] },
+      ],
+      action: "resumeAction",
+      text: "",
+      turns: 1,
+    },
+    {
+      name: "new user turn after an empty tool result",
+      messages: [
+        { role: "system", content: "sys follow up" },
+        { role: "user", content: "first q" },
+        { role: "assistant", content: null, tool_calls: [toolCall] },
+        { role: "tool", tool_call_id: "call_1", content: "" },
+        { role: "user", content: "FOLLOW UP" },
+      ],
+      action: "userMessageAction",
+      text: "FOLLOW UP",
+      turns: 1,
     },
   ];
 
@@ -1399,10 +1469,12 @@ async function testRunActionAfterToolHistory(modules: TestModules, backend: Test
         });
         await res.text();
         await waitFor(() => backend.getRunRequests().length > 0, `a run request (${label})`);
-        const action = backend.getRunRequests()[0]!.value.action?.action;
+        const runReq = backend.getRunRequests()[0]!.value;
+        const action = runReq.action?.action;
         assertEqual(action?.case, testCase.action, `Run action (${label})`);
         const text = action?.case === "userMessageAction" ? action.value.userMessage?.text : "";
         assertEqual(text, testCase.text, `Run action text (${label})`);
+        assertEqual(runReq.conversationState?.turns.length ?? 0, testCase.turns, `Turns count (${label})`);
       } finally {
         modules.stopProxy();
       }
