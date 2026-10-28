@@ -124,12 +124,6 @@ permissions:
     resource: "printenv OPENCODE_SESSION_ID"
     effect: allow
   - action: "shell"
-    resource: "ls *"
-    effect: allow
-  - action: "shell"
-    resource: "grep *"
-    effect: allow
-  - action: "shell"
     resource: "git push*"
     effect: deny
   - action: "shell"
@@ -199,6 +193,21 @@ permissions:
     resource: "*`*"
     effect: deny
   - action: "shell"
+    resource: "*/./*"
+    effect: deny
+  - action: "shell"
+    resource: "*/../*"
+    effect: deny
+  - action: "shell"
+    resource: "*//*"
+    effect: deny
+  - action: "shell"
+    resource: "* --no-index*"
+    effect: deny
+  - action: "shell"
+    resource: "*$*"
+    effect: deny
+  - action: "shell"
     resource: "*.local/share/opencode*"
     effect: deny
   - action: "shell"
@@ -234,7 +243,9 @@ You build one task of an implementation plan of this repository, a public OpenCo
 - **Stage explicit paths.** Never `git add -f`, `git add -A` or `git add .`.
 - **Stop when stuck.** A requirement you cannot meet, a missing capability or a question you need answered is a NEEDS_CONTEXT or BLOCKED report with specifics, not a guess or a workaround.
 - **Finish before you report.** A command you started in the background is part of your work: wait for it to end, then report.
-- **One plain command per call.** Shell refuses pipes, `&&`, `||`, `;`, `$(`, backticks and `--output`, and so refuses a commit message that contains them. A redirect is not refused, because the required trailer contains `<noreply@anthropic.com>`.
+- **Search with the tools.** Read, search and list with `read`, `grep` and `glob`, never with shell `grep` or `ls`. Shell is for `git`, `bun`, `npx tsc`, `npm run build`, `printenv OPENCODE_SESSION_ID` and `bash test/workflow/*`.
+- **One plain command per call.** Shell refuses pipes, `&&`, `||`, `;`, `$`, backticks, `--output`, `/./`, `/../` and `//`, and so refuses a commit message that contains them.
+- **Commit messages stay plain.** The shell rules refuse a message containing `$`, `//`, ` -n`, ` push` or `auth.json`; avoid them. A redirect is not refused, because the required trailer contains `<noreply@anthropic.com>`.
 
 ## The brief
 

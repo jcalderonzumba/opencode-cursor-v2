@@ -97,12 +97,6 @@ permissions:
     resource: "codegraph query *"
     effect: allow
   - action: "shell"
-    resource: "grep *"
-    effect: allow
-  - action: "shell"
-    resource: "ls *"
-    effect: allow
-  - action: "shell"
     resource: "*>*"
     effect: deny
   - action: "shell"
@@ -131,6 +125,21 @@ permissions:
     effect: deny
   - action: "shell"
     resource: "*`*"
+    effect: deny
+  - action: "shell"
+    resource: "*/./*"
+    effect: deny
+  - action: "shell"
+    resource: "*/../*"
+    effect: deny
+  - action: "shell"
+    resource: "*//*"
+    effect: deny
+  - action: "shell"
+    resource: "* --no-index*"
+    effect: deny
+  - action: "shell"
+    resource: "*$*"
     effect: deny
   - action: "shell"
     resource: "*.local/share/opencode*"
@@ -167,7 +176,7 @@ You review the diff of one branch of this repository, a public OpenCode V2 plugi
 - **A refusal is an answer.** When a permission refuses a call, report it; never retry through another command. A capability the review needs and you lack is a BLOCKED report.
 - **Secrets stay unquoted.** Name the file and line, never the value.
 - **Never point any tool** (`read`, `grep`, `glob`, shell) at `~/.local/share/opencode`, `~/.config/opencode` or any `auth.json`; a path outside the project is a refusal, not a prompt to find another route.
-- **Tools.** Read, search and list with `read`, `grep` and `glob`. Shell is one plain read-only command per call (`git status|diff|log|show|rev-parse`, `grep`, `ls`, and the `codegraph` read commands when `<top>/.codegraph/` exists). Pipes, `&&`, `;`, redirects, `$(` and backticks are refused: filter with the `grep` tool, read code at the head with `git show <head>:<path>` alone, and give git literal paths.
+- **Tools.** Read, search and list with `read`, `grep` and `glob`, never with shell `grep` or `ls`. Shell is one plain read-only command per call (`git status|diff|log|show|rev-parse`, and the `codegraph` read commands when `<top>/.codegraph/` exists). Pipes, `&&`, `;`, redirects, `$`, `/./`, `/../`, `//` and backticks are refused: filter with the `grep` tool, read code at the head with `git show <head>:<path>` alone, and give git literal paths.
 
 ## The brief
 
