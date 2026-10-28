@@ -126,7 +126,7 @@ refused "round 2 without changes is refused" "--changes" --phase "$PLAN" 4 "${ST
 
 new_repo
 touch "$REVIEW/round-1.md"
-refused "changes that is a directory is refused" "--changes" --phase "$PLAN" 4 "${STD[@]}" --changes "$TMP"
+refused "changes that is a directory is refused" "missing or empty" --phase "$PLAN" 4 "${STD[@]}" --changes "$TMP"
 
 new_repo
 touch "$REVIEW/round-1.malformed-1.md"
