@@ -10,13 +10,21 @@ the plugin loads and registers the `cursor` integration and its OAuth method.
 Model discovery and chat need a real Cursor login, which that check did not
 cover.
 
-Install the plugin:
+Install the plugin from a local checkout. Clone this repository, then build it:
 
 ```sh
-opencode plugin add opencode-cursor-oauth
+npm run build
 ```
 
-The command adds the package to your global V2 configuration.
+Create `~/.config/opencode/plugins/opencode-cursor-v2.js` with one line, where
+`<checkout>` is the absolute path of your clone:
+
+```js
+export { default } from "<checkout>/dist/v2.js";
+```
+
+Restart OpenCode to load the plugin. Rebuild and restart after each change to
+the source.
 
 Start `opencode`.
 Run `/connect`.
@@ -24,19 +32,10 @@ Select Cursor.
 
 The plugin adds Cursor OAuth and the available models to the V2 catalog.
 
-You can also add the package directly to `opencode.jsonc`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    "opencode-cursor-oauth"
-  ]
-}
-```
-
-OpenCode installs npm plugins during startup.
-You do not have to clone this repository.
+Two other routes do not work on OpenCode 2.1.4. A path entry in the `plugins`
+array of `opencode.jsonc` (a directory path, a `file://` URL, or a symlink) is
+not loaded. `opencode plugin add` refuses a `file:` tarball: the target must be
+an npm registry package or a Git package specifier.
 
 ## Use
 
@@ -60,25 +59,14 @@ Bun's `node:http2` support is not reliable against Cursor's API.
 ### HTTP/1.1 fallback
 
 HTTP/2 stays the default. Use the HTTP/1.1 transport when the H2 bridge cannot
-connect, for example behind corporate proxies that block HTTP/2. Set the
-`disableHttp2` plugin option in the `plugins` array of `opencode.jsonc`:
+connect, for example behind corporate proxies that block HTTP/2. Start OpenCode
+with `CURSOR_DISABLE_HTTP2=1` in its environment:
 
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "opencode-cursor-oauth",
-      "options": { "disableHttp2": true }
-    }
-  ]
-}
+```sh
+CURSOR_DISABLE_HTTP2=1 opencode
 ```
 
-`CURSOR_DISABLE_HTTP2=1` does the same when the option is omitted. An explicit
-`true` or `false` option wins over the environment variable; a value that is
-not a boolean is ignored. Model discovery and agent turns use the same
-transport.
+Model discovery and agent turns use the same transport.
 
 The HTTP/1.1 transport has only been tested against a fake backend, not a real
 blocking proxy.
@@ -150,6 +138,8 @@ bun test/smoke.ts
 ```
 
 The first line turns on the git hooks that refuse commits and pushes on `main`.
+
+`bash scripts/load-local.sh` (on `main`) rebuilds the plugin and checks that the running OpenCode lists the `cursor` integration.
 
 `@opencode/plugin` is only a devDependency (types and the smoke test): the OpenCode host provides it to plugins at runtime.
 
