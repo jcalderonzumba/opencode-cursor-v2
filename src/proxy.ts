@@ -345,8 +345,8 @@ export function setHttp1PausedStreamMaxMsForTesting(ms = HTTP1_PAUSED_STREAM_MAX
   http1PausedStreamMaxMs = ms;
 }
 
-// An active turn with no server bytes for this long is stalled. Client
-// heartbeats do not count, and a pause for a tool result is exempt.
+// An active turn with no decoded progress for this long is stalled. Client and
+// server heartbeats do not count, and a pause for a tool result is exempt.
 const STREAM_STALL_MAX_MS = 120_000;
 let streamStallMaxMs = STREAM_STALL_MAX_MS;
 
@@ -355,25 +355,34 @@ export function setStreamStallMaxMsForTesting(ms = STREAM_STALL_MAX_MS): void {
   streamStallMaxMs = ms;
 }
 
-/** Idle timer over server bytes only. `stop` exempts a tool-result pause. */
+/**
+ * Decides stall liveness: a decoded server message counts only when it carries
+ * turn content. A bare heartbeat (or an empty message) proves the socket is
+ * open, not that the turn advances, so it must not reset the clock.
+ */
+function isTurnProgress(msg: AgentServerMessage): boolean {
+  const msgCase = msg.message.case;
+  if (msgCase === undefined) return false;
+  if (msgCase === "interactionUpdate") {
+    const updateCase = msg.message.value.message?.case;
+    return updateCase !== undefined && updateCase !== "heartbeat";
+  }
+  return true;
+}
+
+/** Idle timer reset by `touch` on turn progress; `stop` clears it on teardown. */
 function createStreamStallWatch(onStall: () => void): { touch: () => void; stop: () => void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
-  let generation = 0;
   return {
     stop() {
       stopped = true;
-      generation += 1;
       clearTimeout(timer);
     },
     touch() {
       clearTimeout(timer);
       if (stopped) return;
-      const current = ++generation;
-      timer = setTimeout(() => {
-        if (stopped || current !== generation) return;
-        onStall();
-      }, streamStallMaxMs);
+      timer = setTimeout(onStall, streamStallMaxMs);
       timer.unref?.();
     },
   };
@@ -1833,10 +1842,9 @@ async function handleHttp1StreamingResponse(
       const abort = new AbortController();
       // Stops BidiAppend retries and the heartbeat, and aborts the RunSSE body.
       let pausedTimer: ReturnType<typeof setTimeout> | undefined;
-      let stopStallWatch = () => {};
       const teardown = () => {
         clearTimeout(pausedTimer);
-        stopStallWatch();
+        stall.stop();
         http1.stop();
         abort.abort();
         activeHttp1Streams.delete(teardown);
@@ -1848,16 +1856,17 @@ async function handleHttp1StreamingResponse(
         teardown();
       };
       const stall = createStreamStallWatch(() => {
+        // mcpExecReceived: silence while OpenCode runs a tool is not a stall.
         if (closed || mcpExecReceived) return;
         reportStalledStream(sendSSE, makeChunk, makeUsageChunk, sendDone);
         closeController();
         teardown();
       });
-      stopStallWatch = stall.stop;
 
       const processChunk = (messageBytes: Uint8Array) => {
         try {
           const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+          if (isTurnProgress(serverMessage)) stall.touch();
           processServerMessage(serverMessage, payload.blobStore, payload.mcpTools, payload.cloudRule,
             sendFrame, state,
             (text, isThinking) => {
@@ -1865,8 +1874,6 @@ async function handleHttp1StreamingResponse(
               else { const { content, reasoning } = tagFilter.process(text); if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning })); if (content) sendSSE(makeChunk({ content })); }
             },
             (exec) => {
-              // The turn is paused for a tool result, so silence is expected.
-              stall.stop();
               state.pendingExecs.push(exec); mcpExecReceived = true;
               const flushed = tagFilter.flush();
               if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1916,7 +1923,6 @@ async function handleHttp1StreamingResponse(
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            if (value.byteLength > 0) stall.touch();
             parser.push(value);
           }
           if (channelError) throw channelError;
@@ -1973,9 +1979,8 @@ function createBridgeStreamResponse(
         if (closed) return;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       };
-      let stopStallWatch = () => {};
       const stopBridge = () => {
-        stopStallWatch();
+        stall.stop();
         if (activeBridges.get(bridgeKey)?.bridge === bridge) {
           activeBridges.delete(bridgeKey);
         }
@@ -2025,12 +2030,12 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
       const stall = createStreamStallWatch(() => {
+        // mcpExecReceived: silence while OpenCode runs a tool is not a stall.
         if (closed || mcpExecReceived) return;
         reportStalledStream(sendSSE, makeChunk, makeUsageChunk, sendDone);
         closeController();
         stopBridge();
       });
-      stopStallWatch = stall.stop;
 
       const parser = createConnectFrameParser(
         (messageBytes) => {
@@ -2039,6 +2044,7 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
+            if (isTurnProgress(serverMessage)) stall.touch();
             processServerMessage(
               serverMessage,
               blobStore,
@@ -2057,8 +2063,6 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
-                // Silence while OpenCode runs the tool is not a stalled turn.
-                stall.stop();
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
@@ -2128,10 +2132,7 @@ function createBridgeStreamResponse(
         },
       );
 
-      bridge.onData((chunk) => {
-        if (chunk.length > 0) stall.touch();
-        parser.push(chunk);
-      });
+      bridge.onData((chunk) => parser.push(chunk));
 
       bridge.onClose((code) => {
         stall.stop();

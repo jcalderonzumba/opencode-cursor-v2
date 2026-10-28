@@ -60,8 +60,10 @@ interface TestCursorBackend {
   setHoldRunStream: (hold: boolean) => void;
   /** While holding, also emit an MCP tool call with this id; the stream answers the tool result and ends. */
   setRunStreamToolCall: (toolCallId: string | undefined) => void;
-  /** While holding, emit a reasoning delta on this interval. `0` stops it. */
-  setRunStreamDripMs: (ms: number) => void;
+  /** While holding, emit a reasoning delta (or a bare heartbeat update) on this interval. `0` stops it. */
+  setRunStreamDripMs: (ms: number, kind?: "thinking" | "heartbeat") => void;
+  /** HTTP/2 only: after the tool result arrives, go silent instead of answering and ending the stream. */
+  setRunStreamSilentAfterToolResult: (silent: boolean) => void;
   /** While holding, also emit this native exec request (id 1, exec id `exec-1`). HTTP/2 only: the HTTP/1 held path ignores it. */
   setRunStreamExec: (message: ExecServerMessage["message"] | undefined) => void;
   getOpenRunStreamCount: () => number;
@@ -191,6 +193,23 @@ function frameRunThinkingDelta(text: string): Buffer {
   );
 }
 
+/** A Connect-framed server heartbeat: bytes on the wire, but no turn progress. */
+function frameRunHeartbeat(): Buffer {
+  return frameConnectUnaryMessage(
+    toBinary(
+      AgentServerMessageSchema,
+      create(AgentServerMessageSchema, {
+        message: {
+          case: "interactionUpdate",
+          value: create(InteractionUpdateSchema, {
+            message: { case: "heartbeat", value: {} },
+          }),
+        },
+      }),
+    ),
+  );
+}
+
 /** A Connect-framed MCP tool call, which makes the proxy pause the stream for a tool result. */
 function frameRunToolCall(toolCallId: string): Buffer {
   return frameRunExec({
@@ -212,6 +231,8 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let holdRunStream = false;
   let runStreamToolCallId: string | undefined;
   let runStreamDripMs = 0;
+  let runStreamDripKind: "thinking" | "heartbeat" = "thinking";
+  let silentAfterToolResult = false;
   const dripTimers = new Set<ReturnType<typeof setInterval>>();
   const startDrip = (
     write: (chunk: Buffer) => void,
@@ -221,7 +242,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     if (runStreamDripMs <= 0) return;
     const timer = setInterval(() => {
       if (ended()) return;
-      write(frameRunThinkingDelta("still thinking"));
+      write(runStreamDripKind === "heartbeat" ? frameRunHeartbeat() : frameRunThinkingDelta("still thinking"));
     }, runStreamDripMs);
     dripTimers.add(timer);
     const stop = () => {
@@ -355,7 +376,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   });
 
   const http2Server = http2.createServer();
+  // A killed bridge may reset the connection while heartbeats are in flight.
+  http2Server.on("session", (session) => session.on("error", () => {}));
   http2Server.on("stream", (stream, headers) => {
+    stream.on("error", () => {});
     const path = String(headers[":path"] ?? "");
     requests.push(`h2 ${path}`);
     const authHeader = String(headers.authorization ?? "");
@@ -412,6 +436,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                     mcpResultTexts.push(item.content.case === "text" ? item.content.value.text : "");
                   }
                 }
+                if (silentAfterToolResult) continue;
                 stream.write(frameRunTextDelta("after-tool"));
                 stream.end();
               }
@@ -468,6 +493,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const apiServer = net.createServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
+    // A killed bridge or aborted client may reset a socket with data in flight.
+    socket.on("error", () => {});
+
     socket.once("data", (first) => {
       socket.pause();
       socket.unshift(first);
@@ -502,8 +530,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     setRunStreamToolCall(toolCallId) {
       runStreamToolCallId = toolCallId;
     },
-    setRunStreamDripMs(ms) {
+    setRunStreamSilentAfterToolResult(silent) {
+      silentAfterToolResult = silent;
+    },
+    setRunStreamDripMs(ms, kind = "thinking") {
       runStreamDripMs = ms;
+      runStreamDripKind = kind;
       if (ms <= 0) {
         for (const timer of dripTimers) clearInterval(timer);
         dripTimers.clear();
@@ -933,6 +965,95 @@ async function testSilentStreamEndsWithError(
     }
   }
   console.log("[test] Silent stream stall OK");
+}
+
+/**
+ * Fails if a stream that only drips heartbeat updates is kept alive: bytes on
+ * the wire are not turn progress, so the stall must still fire.
+ */
+async function testHeartbeatOnlyStreamStalls(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing a heartbeat-only stream still ends with a stall error...");
+  const limitMs = 500;
+  const dripMs = 100;
+  for (const disableHttp2 of [false, true] as const) {
+    const label = disableHttp2 ? "HTTP/1.1" : "HTTP/2";
+    modules.setStreamStallMaxMsForTesting(limitMs);
+    backend.resetObservations();
+    backend.setHoldRunStream(true);
+    backend.setRunStreamDripMs(dripMs, "heartbeat");
+    const controller = new AbortController();
+    try {
+      const port = await modules.startProxy(async () => "test-token", [], disableHttp2);
+      const res = await postChat(port, [{ role: "user", content: `heartbeat ${label}` }], controller.signal);
+      assertEqual(res.status, 200, `${label}: expected a streaming response`);
+      const body = await withTimeout(readUntilDone(res), `${label}: the heartbeat-only stream to end`, 5_000);
+      assert(
+        body.includes("[Error: Cursor stream stalled]"),
+        `${label}: expected a stall error, got ${body}`,
+      );
+      assert(body.includes("data: [DONE]"), `${label}: expected [DONE], got ${body}`);
+      await waitFor(
+        () => backend.getOpenRunStreamCount() === 0,
+        `${label}: the upstream stream to close after the stall`,
+      );
+    } finally {
+      controller.abort();
+      modules.stopProxy();
+      backend.setHoldRunStream(false);
+      backend.setRunStreamDripMs(0);
+      modules.setStreamStallMaxMsForTesting();
+    }
+  }
+  console.log("[test] Heartbeat-only stall OK");
+}
+
+/**
+ * Fails if the bridge resumed after a tool result (handleToolResultResume)
+ * hangs on a silent upstream instead of ending with a stall error.
+ */
+async function testStallAfterToolResultResume(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing a stall after a tool-result resume ends with an error...");
+  const limitMs = 500;
+  modules.setStreamStallMaxMsForTesting(limitMs);
+  backend.resetObservations();
+  backend.setHoldRunStream(true);
+  backend.setRunStreamToolCall("call-resume-stall");
+  backend.setRunStreamSilentAfterToolResult(true);
+  const controller = new AbortController();
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const first = await withTimeout(
+      postChat(port, toolCallMessages("call-resume-stall", false), controller.signal).then(readUntilDone),
+      "the tool call to reach the stream",
+    );
+    assert(first.includes("call-resume-stall"), `Expected the tool call, got: ${first}`);
+
+    const body = await withTimeout(
+      postChat(port, toolCallMessages("call-resume-stall", true), controller.signal).then(readUntilDone),
+      "the resumed silent stream to end",
+      5_000,
+    );
+    assert(body.includes("[Error: Cursor stream stalled]"), `Expected a stall error after the resume, got ${body}`);
+    assert(body.includes("data: [DONE]"), `Expected [DONE] after the resume, got ${body}`);
+    await waitFor(
+      () => backend.getOpenRunStreamCount() === 0,
+      "the upstream stream to close after the resumed stall",
+    );
+  } finally {
+    controller.abort();
+    modules.stopProxy();
+    backend.setHoldRunStream(false);
+    backend.setRunStreamToolCall(undefined);
+    backend.setRunStreamSilentAfterToolResult(false);
+    modules.setStreamStallMaxMsForTesting();
+  }
+  console.log("[test] Stall after tool-result resume OK");
 }
 
 /**
@@ -2383,6 +2504,8 @@ async function main() {
     await run(testHttp1NonStreamingSurfacesUpstreamErrors, modules, backend);
     await run(testHttp1PausedStreamIsCapped, modules, backend);
     await run(testSilentStreamEndsWithError, modules, backend);
+    await run(testHeartbeatOnlyStreamStalls, modules, backend);
+    await run(testStallAfterToolResultResume, modules, backend);
     await run(testSlowStreamIsNotCutOff, modules, backend);
     await run(testPausedStreamIgnoresStall, modules, backend);
     await run(testCancelPausedBridgeKeepsBridge, modules, backend);
